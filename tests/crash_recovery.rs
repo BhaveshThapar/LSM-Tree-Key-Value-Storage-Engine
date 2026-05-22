@@ -29,7 +29,7 @@ fn run_child_if_requested() {
         return;
     }
     let dir = std::env::var(DIR_ENV).expect("child needs target dir");
-    let mut db = Db::open_with(&dir, opts()).expect("child: open");
+    let db = Db::open_with(&dir, opts()).expect("child: open");
     let stdout = std::io::stdout();
     for i in 0u64.. {
         let key = format!("key{i:08}");

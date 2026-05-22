@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
         _ => return Err(usage()),
     };
 
-    let mut db = Db::open(dir).map_err(|e| e.to_string())?;
+    let db = Db::open(dir).map_err(|e| e.to_string())?;
     match cmd[0].as_str() {
         "put" if cmd.len() == 3 => {
             db.put(cmd[1].as_bytes(), cmd[2].as_bytes())

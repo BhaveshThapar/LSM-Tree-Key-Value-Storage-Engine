@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(rustc --version)"
+      "Bash(rustc --version)",
+      "Bash(cd \"/Users/bhavesh/Desktop/Projects/DONE/Creative Projects/LSM-Tree_KV_Store\" && rm -rf /tmp/lsm_smoke && ls && echo \"---\" && git status --short)",
+      "Bash(cargo test *)",
+      "Bash(cargo add *)",
+      "Bash(cargo clippy *)"
+    ],
+    "additionalDirectories": [
+      "/private/tmp/lsm_smoke"
     ]
   }
 }

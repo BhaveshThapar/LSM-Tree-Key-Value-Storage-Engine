@@ -10,5 +10,3 @@
 /fuzz/artifacts
 /fuzz/coverage
 /fuzz/Cargo.lock
-
-/.claude

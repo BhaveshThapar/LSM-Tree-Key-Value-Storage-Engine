@@ -15,7 +15,7 @@ const VALUE: &[u8] = b"the-quick-brown-fox-jumps-over-payload-0123456789";
 /// A database pre-loaded with `n` keys, flushed to SSTables on disk.
 fn loaded_db(opts: Options, n: u64) -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Db::open_with(dir.path(), opts).unwrap();
+    let db = Db::open_with(dir.path(), opts).unwrap();
     for i in 0..n {
         db.put(&key(i), VALUE).unwrap();
     }
@@ -32,7 +32,7 @@ fn bench_writes(c: &mut Criterion) {
             sync_wal: false,
             ..Options::default()
         };
-        let mut db = Db::open_with(dir.path(), opts).unwrap();
+        let db = Db::open_with(dir.path(), opts).unwrap();
         let mut i = 0u64;
         b.iter(|| {
             db.put(&key(i), VALUE).unwrap();
@@ -93,7 +93,7 @@ fn bench_post_compaction(c: &mut Criterion) {
                     compaction_threshold: 4,
                     ..Options::default()
                 };
-                let mut db = Db::open_with(dir.path(), opts).unwrap();
+                let db = Db::open_with(dir.path(), opts).unwrap();
                 for batch in 0..8u64 {
                     for i in 0..5_000u64 {
                         db.put(&key(batch * 5_000 + i), VALUE).unwrap();

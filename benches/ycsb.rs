@@ -70,7 +70,7 @@ fn fresh_lsm() -> (tempfile::TempDir, Db) {
         sync_wal: false,
         ..Options::default()
     };
-    let mut db = Db::open_with(dir.path(), opts).unwrap();
+    let db = Db::open_with(dir.path(), opts).unwrap();
     for i in 0..N_KEYS {
         db.put(&key(i), VALUE).unwrap();
     }
@@ -87,7 +87,7 @@ fn fresh_rocks() -> (tempfile::TempDir, rocksdb::DB) {
     (dir, db)
 }
 
-fn run_lsm(db: &mut Db, ops: &[Op]) {
+fn run_lsm(db: &Db, ops: &[Op]) {
     for op in ops {
         match *op {
             Op::Read(k) => {
@@ -122,7 +122,7 @@ fn bench_ycsb(c: &mut Criterion) {
             group.bench_function("lsm_kv", |b| {
                 b.iter_batched(
                     fresh_lsm,
-                    |(_dir, mut db)| run_lsm(&mut db, &ops),
+                    |(_dir, db)| run_lsm(&db, &ops),
                     BatchSize::PerIteration,
                 );
             });

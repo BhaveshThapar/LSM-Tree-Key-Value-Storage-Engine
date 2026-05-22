@@ -108,7 +108,7 @@ in-process RocksDB baseline — full numbers and methodology in
 
 | Workload | `lsm_kv` vs RocksDB |
 |---|---|
-| YCSB A (50/50 read/write), uniform | 67% |
+| YCSB A (50/50 read/write), uniform | 64% |
 | YCSB A (50/50 read/write), zipfian | 111% |
 | YCSB C (100% read), zipfian | 39% |
 

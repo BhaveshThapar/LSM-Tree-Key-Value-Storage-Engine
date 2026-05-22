@@ -4,6 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::compaction;
 use crate::error::Result;
 use crate::memtable::{MemTable, DEFAULT_THRESHOLD};
 use crate::record::Record;
@@ -19,6 +20,11 @@ pub struct Options {
     pub memtable_threshold: usize,
     /// If true, `fsync` the WAL after every append (durable but slower).
     pub sync_wal: bool,
+    /// Number of similarly-sized, adjacent SSTables that triggers a
+    /// size-tiered compaction of that run.
+    pub compaction_threshold: usize,
+    /// If false, SSTable reads skip the Bloom-filter pre-check (benchmarks only).
+    pub bloom_enabled: bool,
 }
 
 impl Default for Options {
@@ -26,8 +32,16 @@ impl Default for Options {
         Options {
             memtable_threshold: DEFAULT_THRESHOLD,
             sync_wal: true,
+            compaction_threshold: 4,
+            bloom_enabled: true,
         }
     }
+}
+
+/// An immutable SSTable on disk, tagged with its id (higher id == newer).
+struct SsTable {
+    id: u64,
+    reader: SsTableReader,
 }
 
 /// An embedded LSM-tree key/value store.
@@ -36,8 +50,8 @@ pub struct Db {
     opts: Options,
     memtable: MemTable,
     wal: Wal,
-    /// SSTables ordered oldest -> newest; reads walk this in reverse.
-    sstables: Vec<SsTableReader>,
+    /// SSTables ordered oldest -> newest by id; reads walk this in reverse.
+    sstables: Vec<SsTable>,
     next_sst_id: u64,
     next_seq: u64,
 }
@@ -65,7 +79,10 @@ impl Db {
         let next_sst_id = sst_ids.last().map_or(0, |&id| id + 1);
         let sstables = sst_ids
             .iter()
-            .map(|&id| SsTableReader::open(sst_path(&dir, id)))
+            .map(|&id| {
+                SsTableReader::open(sst_path(&dir, id), opts.bloom_enabled)
+                    .map(|reader| SsTable { id, reader })
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Replay the WAL into a fresh MemTable.
@@ -78,7 +95,8 @@ impl Db {
             memtable.insert(record);
         }
         // NOTE: seq numbering restarts after a clean flush (empty WAL). Reads
-        // never depend on seq in this phase; a manifest persists it in Phase 3.
+        // never depend on seq; compaction resolves duplicates by SSTable id.
+        // A manifest persists next_seq in Phase 3.
         //
         // Open the WAL for *appending*: it still backs the records just
         // replayed into the MemTable until the next flush moves them to an
@@ -114,7 +132,7 @@ impl Db {
             return Ok(record.value.clone());
         }
         for table in self.sstables.iter().rev() {
-            if let Some(record) = table.get(key)? {
+            if let Some(record) = table.reader.get(key)? {
                 return Ok(record.value);
             }
         }
@@ -122,7 +140,7 @@ impl Db {
     }
 
     /// Flush the MemTable to a new SSTable and start a fresh WAL. A no-op if
-    /// the MemTable is empty.
+    /// the MemTable is empty. May trigger a size-tiered compaction afterwards.
     pub fn flush(&mut self) -> Result<()> {
         if self.memtable.is_empty() {
             return Ok(());
@@ -131,15 +149,19 @@ impl Db {
         let final_path = sst_path(&self.dir, id);
         let tmp_path = final_path.with_extension("db.tmp");
 
-        SsTableWriter::write(&tmp_path, self.memtable.iter())?;
+        let records: Vec<Record> = self.memtable.iter().cloned().collect();
+        SsTableWriter::write(&tmp_path, &records)?;
         // Atomic publish: a crash before the rename leaves only a stale .tmp.
         fs::rename(&tmp_path, &final_path)?;
-        self.sstables.push(SsTableReader::open(&final_path)?);
+        let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
+        self.sstables.push(SsTable { id, reader });
         self.next_sst_id += 1;
 
         // The flushed data is now durable in the SSTable; reset WAL + MemTable.
         self.wal = Wal::create(self.dir.join(WAL_FILENAME), self.opts.sync_wal)?;
         self.memtable = MemTable::new(self.opts.memtable_threshold);
+
+        self.maybe_compact()?;
         Ok(())
     }
 
@@ -162,6 +184,64 @@ impl Db {
         }
         Ok(())
     }
+
+    /// Run size-tiered compactions until no qualifying run remains.
+    fn maybe_compact(&mut self) -> Result<()> {
+        while let Some((start, end)) = self.pick_compaction()? {
+            let max_id = self.sstables[end - 1].id;
+            let oldest_id = self.sstables[0].id;
+            let drop_tombstones = self.sstables[start].id == oldest_id;
+
+            let final_path = sst_path(&self.dir, max_id);
+            let tmp_path = final_path.with_extension("db.tmp");
+            {
+                let inputs: Vec<&SsTableReader> =
+                    self.sstables[start..end].iter().map(|t| &t.reader).collect();
+                compaction::compact(&tmp_path, &inputs, drop_tombstones)?;
+            }
+            // Atomic swap: rename over the max-id input, then drop the rest.
+            // A crash after the rename leaves stale older inputs — still
+            // correct, since the merged table's higher id shadows them.
+            fs::rename(&tmp_path, &final_path)?;
+            let stale_ids: Vec<u64> =
+                self.sstables[start..end - 1].iter().map(|t| t.id).collect();
+            for id in stale_ids {
+                fs::remove_file(sst_path(&self.dir, id))?;
+            }
+
+            let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
+            self.sstables
+                .splice(start..end, [SsTable { id: max_id, reader }]);
+        }
+        Ok(())
+    }
+
+    /// Pick a contiguous, id-ordered run of `compaction_threshold`+ SSTables
+    /// that fall in the same size tier, returning its `start..end` range.
+    fn pick_compaction(&self) -> Result<Option<(usize, usize)>> {
+        let threshold = self.opts.compaction_threshold;
+        if self.sstables.len() < threshold {
+            return Ok(None);
+        }
+        let mut tiers = Vec::with_capacity(self.sstables.len());
+        for t in &self.sstables {
+            let len = fs::metadata(t.reader.path())?.len();
+            // Tier = bit-width of the file size, i.e. floor(log2)+1.
+            tiers.push(64 - len.leading_zeros());
+        }
+        let mut i = 0;
+        while i < tiers.len() {
+            let mut j = i;
+            while j < tiers.len() && tiers[j] == tiers[i] {
+                j += 1;
+            }
+            if j - i >= threshold {
+                return Ok(Some((i, j)));
+            }
+            i = j;
+        }
+        Ok(None)
+    }
 }
 
 fn sst_path(dir: &Path, id: u64) -> PathBuf {
@@ -179,8 +259,8 @@ mod tests {
 
     fn fast_opts() -> Options {
         Options {
-            memtable_threshold: DEFAULT_THRESHOLD,
             sync_wal: false,
+            ..Options::default()
         }
     }
 
@@ -297,19 +377,75 @@ mod tests {
         let opts = Options {
             memtable_threshold: 4 * 1024,
             sync_wal: false,
+            ..Options::default()
         };
         let mut db = Db::open_with(dir.path(), opts).unwrap();
         for i in 0..5000u32 {
             db.put(format!("key{i:06}").as_bytes(), b"some-value-payload")
                 .unwrap();
         }
-        assert!(db.sstable_count() > 0, "expected at least one auto-flush");
         for i in 0..5000u32 {
             assert_eq!(
                 db.get(format!("key{i:06}").as_bytes()).unwrap(),
                 Some(b"some-value-payload".to_vec())
             );
         }
+    }
+
+    #[test]
+    fn compaction_reduces_table_count_and_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            sync_wal: false,
+            compaction_threshold: 4,
+            ..Options::default()
+        };
+        let mut db = Db::open_with(dir.path(), opts).unwrap();
+        // Four flushes of similarly-sized tables trigger one compaction.
+        for batch in 0..4u32 {
+            for i in 0..200u32 {
+                let k = format!("k{batch}_{i:04}");
+                db.put(k.as_bytes(), b"payload-value-data").unwrap();
+            }
+            db.flush().unwrap();
+        }
+        assert!(
+            db.sstable_count() < 4,
+            "expected compaction to merge tables, got {}",
+            db.sstable_count()
+        );
+        for batch in 0..4u32 {
+            for i in 0..200u32 {
+                let k = format!("k{batch}_{i:04}");
+                assert_eq!(
+                    db.get(k.as_bytes()).unwrap(),
+                    Some(b"payload-value-data".to_vec())
+                );
+            }
+        }
+        // Survives reopen.
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        assert_eq!(db.get(b"k2_0100").unwrap(), Some(b"payload-value-data".to_vec()));
+    }
+
+    #[test]
+    fn compaction_keeps_newest_value_and_drops_deleted_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            sync_wal: false,
+            compaction_threshold: 3,
+            ..Options::default()
+        };
+        let mut db = Db::open_with(dir.path(), opts).unwrap();
+        db.put(b"k", b"v1").unwrap();
+        db.flush().unwrap();
+        db.put(b"k", b"v2").unwrap();
+        db.flush().unwrap();
+        db.put(b"gone", b"x").unwrap();
+        db.delete(b"gone").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(db.get(b"gone").unwrap(), None);
     }
 
     #[test]

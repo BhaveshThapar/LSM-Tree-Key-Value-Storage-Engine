@@ -11,9 +11,22 @@ path = "src/bin/lsm.rs"
 [dependencies]
 thiserror = "2"
 crc32fast = "1"
+lz4_flex = "0.11"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+rocksdb = "0.22"
+rand = "0.8"
+
+[[bench]]
+name = "engine"
+harness = false
+
+[[bench]]
+name = "ycsb"
+harness = false
 
 [profile.release]
 lto = true

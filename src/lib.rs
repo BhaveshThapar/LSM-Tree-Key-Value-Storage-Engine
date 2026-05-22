@@ -14,6 +14,8 @@
 //! # Ok::<(), lsm_kv::Error>(())
 //! ```
 
+mod bloom;
+mod compaction;
 mod db;
 mod error;
 mod memtable;

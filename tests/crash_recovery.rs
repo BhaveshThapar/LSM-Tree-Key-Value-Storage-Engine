@@ -19,6 +19,7 @@ fn opts() -> Options {
     Options {
         memtable_threshold: 16 * 1024,
         sync_wal: true,
+        ..Options::default()
     }
 }
 

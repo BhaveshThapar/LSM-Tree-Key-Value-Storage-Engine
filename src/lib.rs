@@ -25,5 +25,5 @@ mod record;
 mod sstable;
 mod wal;
 
-pub use db::{Db, Options};
+pub use db::{Db, Options, Snapshot};
 pub use error::{Error, Result};

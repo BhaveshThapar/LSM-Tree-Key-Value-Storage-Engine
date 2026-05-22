@@ -6,6 +6,7 @@
 //! across threads (typically via `Arc<Db>`). Flushing the MemTable runs on a
 //! background worker thread, so writers never stall waiting on flush I/O.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,9 @@ pub(crate) struct DbInner {
     /// Serializes compaction steps (the background thread and an explicit
     /// `flush()` can both drive them).
     compaction_lock: Mutex<()>,
+    /// Live snapshots: sequence-number horizon -> reference count. Compaction
+    /// preserves every record version visible to the lowest horizon.
+    snapshots: Mutex<BTreeMap<u64, usize>>,
     /// Triggers background flushes.
     worker_tx: Sender<Task>,
     /// Triggers background compaction.
@@ -199,6 +203,7 @@ impl Db {
             manifest: Mutex::new(manifest),
             flush_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
+            snapshots: Mutex::new(BTreeMap::new()),
             worker_tx: flush_tx.clone(),
             compact_tx: compact_tx.clone(),
         });
@@ -258,7 +263,7 @@ impl Db {
 
     /// Return the current value for `key`, or `None` if absent or deleted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
+        self.inner.get_at(key, u64::MAX)
     }
 
     /// Flush the MemTable to a new SSTable and start a fresh WAL, then run any
@@ -273,6 +278,46 @@ impl Db {
     /// Number of immutable SSTables currently on disk.
     pub fn sstable_count(&self) -> usize {
         self.inner.sstables.read().len()
+    }
+
+    /// Take a point-in-time [`Snapshot`]: subsequent [`get_at`](Db::get_at)
+    /// reads through it observe only writes made before this call.
+    ///
+    /// While a snapshot is alive, compaction preserves the record versions it
+    /// can see, so a long-lived snapshot pins disk space.
+    pub fn snapshot(&self) -> Snapshot {
+        let horizon = self.inner.next_seq.load(Ordering::SeqCst);
+        *self.inner.snapshots.lock().entry(horizon).or_insert(0) += 1;
+        Snapshot {
+            horizon,
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Read `key` as of `snapshot` — the value it had when the snapshot was
+    /// taken, ignoring every later write.
+    pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.get_at(key, snapshot.horizon)
+    }
+}
+
+/// A point-in-time view of the database. Reads through a snapshot (via
+/// [`Db::get_at`]) see only writes that preceded [`Db::snapshot`].
+pub struct Snapshot {
+    /// Sequence-number horizon: records with `seq < horizon` are visible.
+    horizon: u64,
+    inner: Arc<DbInner>,
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        let mut snapshots = self.inner.snapshots.lock();
+        if let Some(count) = snapshots.get_mut(&self.horizon) {
+            *count -= 1;
+            if *count == 0 {
+                snapshots.remove(&self.horizon);
+            }
+        }
     }
 }
 
@@ -302,24 +347,36 @@ impl DbInner {
     }
 
     /// Resolve `key` across the active MemTable, the frozen MemTable, then the
-    /// SSTables newest-to-oldest.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        if let Some(record) = self.active.read().get(key) {
+    /// SSTables newest-to-oldest. Only records with `seq < seq_bound` are
+    /// visible — `u64::MAX` resolves the latest value.
+    fn get_at(&self, key: &[u8], seq_bound: u64) -> Result<Option<Vec<u8>>> {
+        if let Some(record) = self.active.read().get_at(key, seq_bound) {
             return Ok(record.value.clone());
         }
         let frozen = self.frozen.read().clone();
         if let Some(frozen) = frozen {
-            if let Some(record) = frozen.get(key) {
+            if let Some(record) = frozen.get_at(key, seq_bound) {
                 return Ok(record.value.clone());
             }
         }
         let sstables = self.sstables.read().clone();
         for table in sstables.iter().rev() {
-            if let Some(record) = table.reader.get(key)? {
+            if let Some(record) = table.reader.get_at(key, seq_bound)? {
                 return Ok(record.value);
             }
         }
         Ok(None)
+    }
+
+    /// The lowest sequence-number horizon any live snapshot can observe, or
+    /// `u64::MAX` when there are none.
+    fn min_snapshot_seq(&self) -> u64 {
+        self.snapshots
+            .lock()
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(u64::MAX)
     }
 
     /// Freeze the active MemTable, write it to a new SSTable, publish it, and
@@ -408,11 +465,15 @@ impl DbInner {
         let max_id = run.last().unwrap().id;
         let drop_tombstones = run[0].id == tables[0].id;
 
+        // Read the snapshot horizon once: new snapshots only take a larger
+        // value, so this stays a valid lower bound for the whole merge.
+        let min_snapshot_seq = self.min_snapshot_seq();
+
         let final_path = sst_path(&self.dir, max_id);
         let tmp_path = final_path.with_extension("db.tmp");
         {
             let inputs: Vec<&SsTableReader> = run.iter().map(|t| &t.reader).collect();
-            compaction::compact(&tmp_path, &inputs, drop_tombstones)?;
+            compaction::compact(&tmp_path, &inputs, drop_tombstones, min_snapshot_seq)?;
         }
 
         // Publish: rename over the max-id input, drop the rest from the
@@ -806,6 +867,60 @@ mod tests {
                 Some(b"payload-value-data".to_vec())
             );
         }
+    }
+
+    #[test]
+    fn snapshot_sees_value_at_capture_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        db.put(b"k", b"v1").unwrap();
+        db.flush().unwrap();
+
+        let snap = db.snapshot();
+        db.put(b"k", b"v2").unwrap();
+        db.flush().unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_sees_absence_of_later_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        db.put(b"early", b"1").unwrap();
+
+        let snap = db.snapshot();
+        db.put(b"late", b"2").unwrap();
+
+        assert_eq!(db.get_at(&snap, b"early").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get_at(&snap, b"late").unwrap(), None);
+        assert_eq!(db.get(b"late").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            sync_wal: false,
+            compaction_threshold: 3,
+            ..Options::default()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+        db.put(b"k", b"v1").unwrap();
+        db.flush().unwrap();
+
+        let snap = db.snapshot();
+
+        // Two more flushes of the same key trigger a compaction that would,
+        // without the snapshot horizon, collapse v1 away.
+        db.put(b"k", b"v2").unwrap();
+        db.flush().unwrap();
+        db.put(b"k", b"v3").unwrap();
+        db.flush().unwrap();
+
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v3".to_vec()));
+        assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
     }
 
     #[test]

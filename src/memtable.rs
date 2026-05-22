@@ -36,8 +36,17 @@ impl MemTable {
     }
 
     /// The most recent record for `key`, if any (may be a tombstone).
+    #[allow(dead_code)] // convenience wrapper over `get_at`; used in tests
     pub fn get(&self, key: &[u8]) -> Option<&Record> {
         self.map.get(key)
+    }
+
+    /// The record for `key` if it is visible at `seq_bound` (its seq is below
+    /// the bound). The MemTable holds only the latest version per key, so a
+    /// snapshot taken between two writes of the same key cannot see the older
+    /// one while both are still buffered here — see the Design B note.
+    pub fn get_at(&self, key: &[u8], seq_bound: u64) -> Option<&Record> {
+        self.map.get(key).filter(|r| r.seq < seq_bound)
     }
 
     /// Records in ascending key order — the flush iteration order.

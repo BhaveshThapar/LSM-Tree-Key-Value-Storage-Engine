@@ -68,13 +68,18 @@ impl SsTableWriter {
             Ok(())
         };
 
-        for record in records {
+        for (i, record) in records.iter().enumerate() {
             bloom.insert(&record.key);
             if block.is_empty() {
                 block_first_key = record.key.clone();
             }
             record.encode_into(&mut block);
-            if block.len() >= BLOCK_SIZE {
+            // Never split a key's versions across blocks: a seq-aware lookup
+            // scans only the one block the binary search lands on.
+            let next_differs = records
+                .get(i + 1)
+                .map_or(true, |next| next.key != record.key);
+            if block.len() >= BLOCK_SIZE && next_differs {
                 flush_block(&mut block, &mut block_first_key, &mut w, &mut offset, &mut index)?;
             }
         }
@@ -244,7 +249,16 @@ impl SsTableReader {
 
     /// Look up `key`, returning its most recent record in this table (which
     /// may be a tombstone) or `None` if the table does not contain it.
+    #[allow(dead_code)] // convenience wrapper over `get_at`; used in tests
     pub fn get(&self, key: &[u8]) -> Result<Option<Record>> {
+        self.get_at(key, u64::MAX)
+    }
+
+    /// Look up `key` as visible at `seq_bound`: the newest record for `key`
+    /// whose sequence number is below the bound. A compacted table may hold
+    /// several versions of a key, stored newest-first, so the scan returns the
+    /// first match it finds at or below the bound.
+    pub fn get_at(&self, key: &[u8], seq_bound: u64) -> Result<Option<Record>> {
         if self.index.is_empty() {
             return Ok(None);
         }
@@ -260,7 +274,10 @@ impl SsTableReader {
         let block = self.load_block(block_offset, comp_len)?;
         for rec in block.iter() {
             match rec.key.as_slice().cmp(key) {
-                Ordering::Equal => return Ok(Some(rec.clone())),
+                // Versions of a key are stored seq-descending, so the first
+                // one below the bound is the newest visible at the bound.
+                Ordering::Equal if rec.seq < seq_bound => return Ok(Some(rec.clone())),
+                Ordering::Equal => {}
                 Ordering::Greater => return Ok(None),
                 Ordering::Less => {}
             }

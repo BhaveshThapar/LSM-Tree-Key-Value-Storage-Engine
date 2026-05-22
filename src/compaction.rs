@@ -29,8 +29,8 @@ impl Eq for MergeItem {}
 
 impl Ord for MergeItem {
     /// Order by key ascending, then by input index ascending. Used inside a
-    /// `Reverse` min-heap, so equal keys surface oldest-input-first — letting
-    /// later (newer) duplicates overwrite earlier ones.
+    /// `Reverse` min-heap, so the merge yields a key-ascending stream with all
+    /// of a key's versions grouped together for per-key retention.
     fn cmp(&self, other: &Self) -> Ordering {
         self.record
             .key
@@ -44,14 +44,22 @@ impl PartialOrd for MergeItem {
     }
 }
 
-/// Merge `inputs` into a single SSTable written to `out_path`. `drop_tombstones`
-/// must be true only when the run includes the globally-oldest SSTable, since
-/// no older table can then still need a delete marker to shadow it.
+/// Merge `inputs` into a single SSTable written to `out_path`.
+///
+/// `drop_tombstones` must be true only when the run includes the
+/// globally-oldest SSTable, since no older table can then still need a delete
+/// marker to shadow it.
+///
+/// `min_snapshot_seq` is the lowest sequence number any live snapshot can
+/// observe (or `u64::MAX` if there are none). Every version at or above it is
+/// preserved for snapshot reads; below it only the newest version per key is
+/// kept. Output is sorted key-ascending, and seq-descending within a key.
 /// Returns the number of records written.
 pub fn compact(
     out_path: &Path,
     inputs: &[&SsTableReader],
     drop_tombstones: bool,
+    min_snapshot_seq: u64,
 ) -> Result<u64> {
     let mut iters: Vec<_> = inputs
         .iter()
@@ -71,7 +79,8 @@ pub fn compact(
         }
     }
 
-    let mut merged: Vec<Record> = Vec::new();
+    // Drain the k-way merge into a flat, key-ascending stream.
+    let mut stream: Vec<Record> = Vec::new();
     while let Some(std::cmp::Reverse(item)) = heap.pop() {
         if let Some(next) = iters[item.input_idx].next() {
             heap.push(std::cmp::Reverse(MergeItem {
@@ -79,19 +88,43 @@ pub fn compact(
                 input_idx: item.input_idx,
             }));
         }
-        // Equal keys pop consecutively, oldest input first; keep the newest.
-        match merged.last() {
-            Some(last) if last.key == item.record.key => {
-                *merged.last_mut().unwrap() = item.record;
-            }
-            _ => merged.push(item.record),
-        }
+        stream.push(item.record);
     }
 
-    if drop_tombstones {
-        merged.retain(|r| r.value.is_some());
+    // Process each key's versions: keep everything visible to a snapshot, plus
+    // the single newest version below the snapshot horizon.
+    let mut out: Vec<Record> = Vec::new();
+    let mut i = 0;
+    while i < stream.len() {
+        let mut j = i + 1;
+        while j < stream.len() && stream[j].key == stream[i].key {
+            j += 1;
+        }
+        let mut group: Vec<Record> = stream[i..j].to_vec();
+        group.sort_by(|a, b| b.seq.cmp(&a.seq)); // seq-descending
+
+        let mut kept: Vec<Record> = Vec::new();
+        let mut newest_below_taken = false;
+        for rec in group {
+            if rec.seq >= min_snapshot_seq {
+                kept.push(rec);
+            } else if !newest_below_taken {
+                kept.push(rec);
+                newest_below_taken = true;
+            }
+        }
+        // In the oldest run a tombstone shadows nothing once no kept version
+        // is older than it; peel such trailing tombstones off the group.
+        if drop_tombstones {
+            while kept.last().is_some_and(|r| r.value.is_none()) {
+                kept.pop();
+            }
+        }
+        out.extend(kept);
+        i = j;
     }
-    SsTableWriter::write(out_path, &merged)
+
+    SsTableWriter::write(out_path, &out)
 }
 
 #[cfg(test)]
@@ -118,7 +151,7 @@ mod tests {
             &[Record::put(b"k".to_vec(), b"new".to_vec(), 2)],
         );
         let out = dir.path().join("out.db");
-        compact(&out, &[&old, &new], false).unwrap();
+        compact(&out, &[&old, &new], false, u64::MAX).unwrap();
         let r = SsTableReader::open(&out, true).unwrap();
         assert_eq!(r.get(b"k").unwrap().unwrap().value, Some(b"new".to_vec()));
     }
@@ -133,7 +166,7 @@ mod tests {
         );
         let new = table(dir.path(), "b.db", &[Record::tombstone(b"k".to_vec(), 2)]);
         let out = dir.path().join("out.db");
-        let n = compact(&out, &[&old, &new], true).unwrap();
+        let n = compact(&out, &[&old, &new], true, u64::MAX).unwrap();
         assert_eq!(n, 0);
         let r = SsTableReader::open(&out, true).unwrap();
         assert!(r.get(b"k").unwrap().is_none());
@@ -149,10 +182,57 @@ mod tests {
         );
         let new = table(dir.path(), "b.db", &[Record::tombstone(b"k".to_vec(), 2)]);
         let out = dir.path().join("out.db");
-        let n = compact(&out, &[&old, &new], false).unwrap();
+        let n = compact(&out, &[&old, &new], false, u64::MAX).unwrap();
         assert_eq!(n, 1);
         let r = SsTableReader::open(&out, true).unwrap();
         assert!(r.get(b"k").unwrap().unwrap().value.is_none());
+    }
+
+    #[test]
+    fn snapshot_horizon_preserves_old_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = table(
+            dir.path(),
+            "a.db",
+            &[Record::put(b"k".to_vec(), b"v1".to_vec(), 1)],
+        );
+        let new = table(
+            dir.path(),
+            "b.db",
+            &[Record::put(b"k".to_vec(), b"v2".to_vec(), 5)],
+        );
+        let out = dir.path().join("out.db");
+        // A snapshot horizon of 3 keeps v2 (seq 5 >= 3) and the newest version
+        // below the horizon (v1, seq 1).
+        compact(&out, &[&old, &new], true, 3).unwrap();
+        let r = SsTableReader::open(&out, true).unwrap();
+        assert_eq!(r.record_count(), 2);
+        assert_eq!(r.get(b"k").unwrap().unwrap().value, Some(b"v2".to_vec()));
+        // The snapshot at horizon 3 still sees v1.
+        assert_eq!(
+            r.get_at(b"k", 3).unwrap().unwrap().value,
+            Some(b"v1".to_vec())
+        );
+    }
+
+    #[test]
+    fn no_snapshot_collapses_to_newest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = table(
+            dir.path(),
+            "a.db",
+            &[Record::put(b"k".to_vec(), b"v1".to_vec(), 1)],
+        );
+        let new = table(
+            dir.path(),
+            "b.db",
+            &[Record::put(b"k".to_vec(), b"v2".to_vec(), 5)],
+        );
+        let out = dir.path().join("out.db");
+        compact(&out, &[&old, &new], true, u64::MAX).unwrap();
+        let r = SsTableReader::open(&out, true).unwrap();
+        assert_eq!(r.record_count(), 1);
+        assert_eq!(r.get(b"k").unwrap().unwrap().value, Some(b"v2".to_vec()));
     }
 
     #[test]
@@ -172,7 +252,7 @@ mod tests {
             &[Record::put(b"b".to_vec(), b"2".to_vec(), 3)],
         );
         let out = dir.path().join("out.db");
-        compact(&out, &[&a, &b], false).unwrap();
+        compact(&out, &[&a, &b], false, u64::MAX).unwrap();
         let r = SsTableReader::open(&out, true).unwrap();
         assert_eq!(r.record_count(), 3);
         for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {

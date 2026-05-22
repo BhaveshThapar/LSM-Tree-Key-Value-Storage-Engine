@@ -1,0 +1,20 @@
+[package]
+name = "lsm_kv"
+version = "0.1.0"
+edition = "2021"
+description = "A log-structured merge-tree key/value storage engine"
+
+[[bin]]
+name = "lsm"
+path = "src/bin/lsm.rs"
+
+[dependencies]
+thiserror = "2"
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

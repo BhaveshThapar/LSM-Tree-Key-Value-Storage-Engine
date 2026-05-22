@@ -17,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use parking_lot::{Mutex, RwLock};
 
 use crate::compaction;
+use crate::compactor::{self, CompactMsg};
 use crate::error::Result;
 use crate::manifest::{Manifest, ManifestState, VersionEdit};
 use crate::memtable::{MemTable, DEFAULT_THRESHOLD};
@@ -57,30 +58,37 @@ struct SsTable {
     reader: SsTableReader,
 }
 
-/// A unit of background work for the worker thread.
+/// A unit of background work for the flush worker thread.
 enum Task {
     Flush,
     Shutdown,
 }
 
-/// Owns the background worker thread and shuts it down on drop.
-struct WorkerHandle {
-    tx: Sender<Task>,
-    handle: Option<JoinHandle<()>>,
+/// Owns the background flush and compaction threads, shutting both down and
+/// joining them on drop.
+struct Workers {
+    flush_tx: Sender<Task>,
+    compact_tx: Sender<CompactMsg>,
+    flush_handle: Option<JoinHandle<()>>,
+    compact_handle: Option<JoinHandle<()>>,
 }
 
-impl Drop for WorkerHandle {
+impl Drop for Workers {
     fn drop(&mut self) {
-        let _ = self.tx.send(Task::Shutdown);
-        if let Some(h) = self.handle.take() {
+        let _ = self.flush_tx.send(Task::Shutdown);
+        if let Some(h) = self.flush_handle.take() {
+            let _ = h.join();
+        }
+        let _ = self.compact_tx.send(CompactMsg::Shutdown);
+        if let Some(h) = self.compact_handle.take() {
             let _ = h.join();
         }
     }
 }
 
 /// The shared, lock-protected engine state. Reachable from both the public
-/// [`Db`] handle and (via a `Weak`) the background worker thread.
-struct DbInner {
+/// [`Db`] handle and (via a `Weak`) the background threads.
+pub(crate) struct DbInner {
     dir: PathBuf,
     opts: Options,
     /// Serializes WAL appends; also held across the matching MemTable insert
@@ -91,22 +99,30 @@ struct DbInner {
     /// A MemTable frozen for flushing; reads still consult it until the flush
     /// publishes its SSTable.
     frozen: RwLock<Option<Arc<MemTable>>>,
-    /// Live SSTables, oldest -> newest by id; swapped wholesale on change.
+    /// Live SSTables, oldest -> newest by position; swapped wholesale on change.
     sstables: RwLock<Arc<Vec<Arc<SsTable>>>>,
     next_sst_id: AtomicU64,
     next_seq: AtomicU64,
     manifest: Mutex<Manifest>,
-    /// Serializes flush/compaction so only one mutates `sstables` at a time.
+    /// Held for the duration of a flush; the publish step of a compaction
+    /// takes it too, so the two never mutate `sstables` concurrently.
     flush_lock: Mutex<()>,
+    /// Serializes compaction steps (the background thread and an explicit
+    /// `flush()` can both drive them).
+    compaction_lock: Mutex<()>,
     /// Triggers background flushes.
     worker_tx: Sender<Task>,
+    /// Triggers background compaction.
+    compact_tx: Sender<CompactMsg>,
 }
 
 /// An embedded LSM-tree key/value store.
 pub struct Db {
-    // Field order matters: `worker` is dropped first, joining the background
-    // thread before `inner` (and its `Arc` refcount) goes away.
-    worker: WorkerHandle,
+    // Field order matters: `workers` is dropped first, joining the background
+    // threads before `inner` (and its `Arc` refcount) goes away. It is only
+    // ever used for that drop-time shutdown.
+    #[allow(dead_code)]
+    workers: Workers,
     inner: Arc<DbInner>,
 }
 
@@ -169,7 +185,8 @@ impl Db {
         // SSTable. Truncating here would lose them if we exit before flushing.
         let wal = Wal::open_append(&wal_path, opts.sync_wal)?;
 
-        let (tx, rx) = mpsc::channel();
+        let (flush_tx, flush_rx) = mpsc::channel();
+        let (compact_tx, compact_rx) = mpsc::channel();
         let inner = Arc::new(DbInner {
             dir,
             opts,
@@ -181,16 +198,23 @@ impl Db {
             next_seq: AtomicU64::new(next_seq),
             manifest: Mutex::new(manifest),
             flush_lock: Mutex::new(()),
-            worker_tx: tx.clone(),
+            compaction_lock: Mutex::new(()),
+            worker_tx: flush_tx.clone(),
+            compact_tx: compact_tx.clone(),
         });
 
-        let weak = Arc::downgrade(&inner);
-        let handle = thread::spawn(move || worker_loop(rx, weak));
+        let flush_weak = Arc::downgrade(&inner);
+        let flush_handle = thread::spawn(move || worker_loop(flush_rx, flush_weak));
+        let compact_weak = Arc::downgrade(&inner);
+        let compact_handle =
+            thread::spawn(move || compactor::compaction_loop(compact_rx, compact_weak));
 
         Ok(Db {
-            worker: WorkerHandle {
-                tx,
-                handle: Some(handle),
+            workers: Workers {
+                flush_tx,
+                compact_tx,
+                flush_handle: Some(flush_handle),
+                compact_handle: Some(compact_handle),
             },
             inner,
         })
@@ -237,10 +261,13 @@ impl Db {
         self.inner.get(key)
     }
 
-    /// Flush the MemTable to a new SSTable and start a fresh WAL, synchronously.
-    /// A no-op if the MemTable is empty. May trigger a size-tiered compaction.
+    /// Flush the MemTable to a new SSTable and start a fresh WAL, then run any
+    /// pending compaction — all synchronously. A no-op if the MemTable is
+    /// empty.
     pub fn flush(&self) -> Result<()> {
-        self.inner.flush_inner()
+        self.inner.flush_inner()?;
+        while self.inner.compact_step()? {}
+        Ok(())
     }
 
     /// Number of immutable SSTables currently on disk.
@@ -357,52 +384,71 @@ impl DbInner {
         }
         *self.frozen.write() = None;
 
-        self.compact_inner()
+        // Compaction runs on its own thread so it never blocks the next flush.
+        let _ = self.compact_tx.send(CompactMsg::Run);
+        Ok(())
     }
 
-    /// Run size-tiered compactions until no qualifying run remains. Caller must
-    /// hold `flush_lock`.
-    fn compact_inner(&self) -> Result<()> {
-        loop {
-            let tables = self.sstables.read().clone();
-            let Some((start, end)) = pick_compaction(&tables, self.opts.compaction_threshold)?
-            else {
-                break;
-            };
-            let max_id = tables[end - 1].id;
-            let oldest_id = tables[0].id;
-            let drop_tombstones = tables[start].id == oldest_id;
+    /// Perform at most one size-tiered compaction. Returns `true` if a run was
+    /// merged (so the caller should call again), `false` if none qualified.
+    ///
+    /// The heavy merge writes the output SSTable without any lock held; only
+    /// the publish step takes `flush_lock`, so flushes proceed concurrently.
+    pub(crate) fn compact_step(&self) -> Result<bool> {
+        let _compaction_guard = self.compaction_lock.lock();
 
-            let final_path = sst_path(&self.dir, max_id);
-            let tmp_path = final_path.with_extension("db.tmp");
-            {
-                let inputs: Vec<&SsTableReader> =
-                    tables[start..end].iter().map(|t| &t.reader).collect();
-                compaction::compact(&tmp_path, &inputs, drop_tombstones)?;
-            }
-            // Atomic swap: rename over the max-id input, then drop the rest.
+        let tables = self.sstables.read().clone();
+        let Some((start, end)) = pick_compaction(&tables, self.opts.compaction_threshold)?
+        else {
+            return Ok(false);
+        };
+        let run: Vec<Arc<SsTable>> = tables[start..end].to_vec();
+        // The merged table reuses the run's highest id, keeping it in the same
+        // position in the live set; the manifest makes the swap crash-safe.
+        let max_id = run.last().unwrap().id;
+        let drop_tombstones = run[0].id == tables[0].id;
+
+        let final_path = sst_path(&self.dir, max_id);
+        let tmp_path = final_path.with_extension("db.tmp");
+        {
+            let inputs: Vec<&SsTableReader> = run.iter().map(|t| &t.reader).collect();
+            compaction::compact(&tmp_path, &inputs, drop_tombstones)?;
+        }
+
+        // Publish: rename over the max-id input, drop the rest from the
+        // manifest, splice the live set, then unlink the stale files.
+        {
+            let _flush_guard = self.flush_lock.lock();
             fs::rename(&tmp_path, &final_path)?;
-            let stale_ids: Vec<u64> = tables[start..end - 1].iter().map(|t| t.id).collect();
-            // Drop the stale inputs from the manifest before unlinking them, so
-            // a crash mid-cleanup leaves them as reclaimable orphans.
+            let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
+
+            let stale_ids: Vec<u64> = run[..run.len() - 1].iter().map(|t| t.id).collect();
             self.manifest.lock().append_batch(
                 &stale_ids
                     .iter()
                     .map(|&id| VersionEdit::DeleteTable { id })
                     .collect::<Vec<_>>(),
             )?;
+
+            // A concurrent flush only appends, so the run is still a contiguous
+            // block ending at `max_id`.
+            let cur = self.sstables.read().clone();
+            let end_pos = cur
+                .iter()
+                .position(|t| t.id == max_id)
+                .expect("compacted run vanished from the live set");
+            let start_pos = end_pos + 1 - run.len();
+            let mut next = Vec::with_capacity(cur.len() - run.len() + 1);
+            next.extend(cur[..start_pos].iter().cloned());
+            next.push(Arc::new(SsTable { id: max_id, reader }));
+            next.extend(cur[end_pos + 1..].iter().cloned());
+            *self.sstables.write() = Arc::new(next);
+
             for id in &stale_ids {
                 fs::remove_file(sst_path(&self.dir, *id))?;
             }
-
-            let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
-            let mut next = Vec::with_capacity(tables.len() - (end - start) + 1);
-            next.extend(tables[..start].iter().cloned());
-            next.push(Arc::new(SsTable { id: max_id, reader }));
-            next.extend(tables[end..].iter().cloned());
-            *self.sstables.write() = Arc::new(next);
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -727,6 +773,38 @@ mod tests {
                     Some(i.to_le_bytes().to_vec())
                 );
             }
+        }
+    }
+
+    #[test]
+    fn background_compaction_bounds_table_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            memtable_threshold: 8 * 1024,
+            sync_wal: false,
+            compaction_threshold: 4,
+            ..Options::default()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+        for i in 0..40_000u32 {
+            db.put(format!("key{i:08}").as_bytes(), b"payload-value-data")
+                .unwrap();
+        }
+        // The compaction thread runs asynchronously; give it time to settle.
+        let mut count = db.sstable_count();
+        for _ in 0..100 {
+            thread::sleep(std::time::Duration::from_millis(20));
+            let now = db.sstable_count();
+            if now == count {
+                break;
+            }
+            count = now;
+        }
+        for i in (0..40_000u32).step_by(97) {
+            assert_eq!(
+                db.get(format!("key{i:08}").as_bytes()).unwrap(),
+                Some(b"payload-value-data".to_vec())
+            );
         }
     }
 

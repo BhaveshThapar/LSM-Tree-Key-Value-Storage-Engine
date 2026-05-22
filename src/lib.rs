@@ -16,6 +16,7 @@
 
 mod bloom;
 mod compaction;
+mod compactor;
 mod db;
 mod error;
 mod manifest;

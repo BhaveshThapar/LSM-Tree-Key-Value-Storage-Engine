@@ -1,10 +1,53 @@
 # lsm_kv
 
-A log-structured merge-tree key/value storage engine in Rust — the storage
-architecture behind RocksDB, LevelDB and Cassandra — built from scratch with a
-write-ahead log, Bloom-filtered block SSTables, size-tiered compaction, a
-crash-safe manifest, concurrent reads/writes, background flush & compaction, and
-point-in-time snapshots.
+**A log-structured merge-tree storage engine in Rust — the database architecture behind RocksDB, LevelDB, and Cassandra, built from scratch.**
+
+![Rust](https://img.shields.io/badge/Rust-2021%20edition-orange?logo=rust)
+![Tests](https://img.shields.io/badge/tests-57%20passing-brightgreen)
+![Benchmarked](https://img.shields.io/badge/YCSB-up%20to%20111%25%20of%20RocksDB-blue)
+![Build](https://img.shields.io/badge/build-cargo-informational)
+
+`lsm_kv` is an embedded, crash-safe key/value database engine: a write-ahead log,
+Bloom-filtered compressed SSTables, background flush and compaction, a
+thread-safe concurrent API, and point-in-time snapshots — benchmarked
+transparently against RocksDB, including where it falls short.
+
+---
+
+## Highlights
+
+- **Crash-safe durability** — a write-ahead log plus an append-only manifest
+  (LevelDB's VersionEdit model) with atomic file swaps and CRC32 integrity
+  checks. Verified by `SIGKILL` fault-injection tests: **zero loss of
+  acknowledged writes**.
+- **Concurrent engine** — a `Send + Sync` `&self` API over `parking_lot`
+  locks and atomics; reads never block writers, and flush/compaction run on
+  dedicated background threads so writers never stall on I/O.
+- **Tuned read path** — per-SSTable Bloom filters, a sparse block index,
+  binary search, LZ4-compressed blocks, and an in-memory block cache —
+  **~5× faster negative lookups**.
+- **MVCC snapshots** — sequence-number versioning gives consistent
+  point-in-time reads; compaction preserves versions a live snapshot can see.
+- **Rigorously tested** — 57 tests: unit, property-based (`proptest` vs. a
+  `HashMap` oracle), `cargo-fuzz` targets, and crash/chaos integration tests.
+  Zero `clippy` warnings.
+- **Honestly benchmarked** — measured against in-process RocksDB on YCSB
+  workloads, with the weak spots named rather than hidden.
+
+## Results
+
+| Metric | Result |
+|---|---|
+| YCSB throughput vs. RocksDB | **64%** write-heavy · **111%** under skewed access |
+| Write throughput | **~648K ops/sec** (~1.54 µs/op) |
+| Point-read latency | ~4.4 µs/op |
+| Bloom-filter speedup | **~5×** on negative lookups (1.09 µs → 218 ns) |
+| Crash recovery | **0 acknowledged writes lost** under `SIGKILL` |
+| Test suite | **57 tests** — unit, property-based, fuzz, crash |
+
+Full numbers and methodology: [BENCHMARKS.md](BENCHMARKS.md).
+
+## Example
 
 ```rust
 use lsm_kv::Db;
@@ -15,8 +58,8 @@ assert_eq!(db.get(b"hello")?, Some(b"world".to_vec()));
 
 let snap = db.snapshot();          // pin a point in time
 db.put(b"hello", b"changed")?;
-assert_eq!(db.get(b"hello")?,        Some(b"changed".to_vec()));
-assert_eq!(db.get_at(&snap, b"hello")?, Some(b"world".to_vec()));
+assert_eq!(db.get(b"hello")?,           Some(b"changed".to_vec()));
+assert_eq!(db.get_at(&snap, b"hello")?, Some(b"world".to_vec()));   // snapshot is unaffected
 ```
 
 ## Architecture
@@ -89,16 +132,16 @@ A record is `[seq:8][type:1][key_len:4][key][val_len:4][val]`; every WAL frame
 and data block is CRC- or LZ4-framed, and replay stops cleanly at the first torn
 trailing frame from a crash mid-append.
 
-## Status
+## Project status
 
-Phases 1–3 are complete:
+Built in three phases — each a self-contained, tested milestone:
 
 - **Phase 1** — WAL, MemTable, SSTables, crash recovery.
 - **Phase 2** — per-SSTable Bloom filters, block-based compressed SSTables,
-  size-tiered compaction, benchmarks vs RocksDB.
+  size-tiered compaction, benchmarks vs. RocksDB.
 - **Phase 3** — crash-safe manifest, `Send + Sync` `&self` API with concurrent
   reads/writes, background flush & compaction, point-in-time snapshots,
-  property tests and fuzz targets.
+  property-based and fuzz testing.
 
 ## Benchmarks
 
@@ -113,7 +156,7 @@ in-process RocksDB baseline — full numbers and methodology in
 | YCSB C (100% read), zipfian | 39% |
 
 Write-heavy workloads are competitive; uniform read-heavy workloads are the
-known weak spot (see *What's missing*).
+known weak spot (see [*What's missing*](#whats-missing)).
 
 ```sh
 cargo bench --bench engine     # engine microbenchmarks
@@ -161,15 +204,15 @@ Honest gaps between this and a production engine:
 ## Building & testing
 
 ```sh
-cargo test                              # unit, property, and crash tests
-cargo build --release                   # optimized library + `lsm` CLI
+cargo test                               # unit, property-based, and crash tests
+cargo build --release                    # optimized library + `lsm` CLI
 
-cargo +nightly fuzz run record_decode    # fuzz the decoders (needs cargo-fuzz)
+cargo +nightly fuzz run record_decode     # fuzz the decoders (needs cargo-fuzz)
 cargo +nightly fuzz run wal_replay
 cargo +nightly fuzz run sstable_open
 ```
 
-The `lsm` CLI is a thin smoke-test wrapper:
+The `lsm` CLI is a thin smoke-test wrapper over the engine:
 
 ```sh
 lsm ./data put hello world
@@ -177,3 +220,9 @@ lsm ./data get hello
 lsm ./data delete hello
 lsm ./data flush
 ```
+
+## Tech stack
+
+Rust (2021 edition) · `parking_lot` (concurrency) · `lz4_flex` (compression) ·
+`crc32fast` (integrity) · `xxhash-rust` (Bloom hashing) · `criterion`
+(benchmarking) · `proptest` (property tests) · `cargo-fuzz` (fuzzing).

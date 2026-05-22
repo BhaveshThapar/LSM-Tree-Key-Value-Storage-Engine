@@ -18,6 +18,7 @@ mod bloom;
 mod compaction;
 mod db;
 mod error;
+mod manifest;
 mod memtable;
 mod record;
 mod sstable;

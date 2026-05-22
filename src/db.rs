@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::compaction;
 use crate::error::Result;
+use crate::manifest::{Manifest, ManifestState, VersionEdit};
 use crate::memtable::{MemTable, DEFAULT_THRESHOLD};
 use crate::record::Record;
 use crate::sstable::{SsTableReader, SsTableWriter};
@@ -54,6 +55,8 @@ pub struct Db {
     sstables: Vec<SsTable>,
     next_sst_id: u64,
     next_seq: u64,
+    /// Authoritative record of the live SSTable set and global counters.
+    manifest: Manifest,
 }
 
 impl Db {
@@ -67,17 +70,32 @@ impl Db {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
-        // Load existing SSTables, ordered oldest -> newest by id.
-        let mut sst_ids = Vec::new();
+        // The manifest is the authoritative record of the live SSTable set and
+        // the global counters. If absent, migrate a Phase 2 directory by
+        // scanning its `sst_*.db` files into a fresh manifest.
+        let (manifest, state) = if Manifest::exists(&dir) {
+            Manifest::open(&dir)?
+        } else {
+            Db::migrate_dir(&dir)?
+        };
+
+        // Reclaim orphan SSTables: any `sst_*.db` not named by the manifest is
+        // a leftover from a crash before its `AddTable` edit was durable.
         for entry in fs::read_dir(&dir)? {
             let name = entry?.file_name();
-            if let Some(id) = parse_sst_id(&name.to_string_lossy()) {
-                sst_ids.push(id);
+            let name = name.to_string_lossy();
+            if let Some(id) = parse_sst_id(&name) {
+                if !state.live_tables.contains(&id) {
+                    fs::remove_file(dir.join(name.as_ref()))?;
+                }
+            } else if name.ends_with(".db.tmp") {
+                fs::remove_file(dir.join(name.as_ref()))?;
             }
         }
-        sst_ids.sort_unstable();
-        let next_sst_id = sst_ids.last().map_or(0, |&id| id + 1);
-        let sstables = sst_ids
+
+        // Open the live SSTables, ordered oldest -> newest by id.
+        let sstables = state
+            .live_tables
             .iter()
             .map(|&id| {
                 SsTableReader::open(sst_path(&dir, id), opts.bloom_enabled)
@@ -85,19 +103,16 @@ impl Db {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Replay the WAL into a fresh MemTable.
+        // Replay the WAL into a fresh MemTable. The manifest persists `next_seq`
+        // across clean flushes; the live WAL may carry seqs beyond it.
         let wal_path = dir.join(WAL_FILENAME);
         let replayed = Wal::replay(&wal_path)?;
         let mut memtable = MemTable::new(opts.memtable_threshold);
-        let mut next_seq = 0;
+        let mut next_seq = state.next_seq;
         for record in replayed {
             next_seq = next_seq.max(record.seq + 1);
             memtable.insert(record);
         }
-        // NOTE: seq numbering restarts after a clean flush (empty WAL). Reads
-        // never depend on seq; compaction resolves duplicates by SSTable id.
-        // A manifest persists next_seq in Phase 3.
-        //
         // Open the WAL for *appending*: it still backs the records just
         // replayed into the MemTable until the next flush moves them to an
         // SSTable. Truncating here would lose them if we exit before flushing.
@@ -109,9 +124,36 @@ impl Db {
             memtable,
             wal,
             sstables,
-            next_sst_id,
+            next_sst_id: state.next_sst_id,
             next_seq,
+            manifest,
         })
+    }
+
+    /// First open of a directory: synthesize a manifest from whatever SSTables
+    /// already exist (a Phase 2 layout, or an empty directory).
+    fn migrate_dir(dir: &Path) -> Result<(Manifest, ManifestState)> {
+        let mut sst_ids = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name();
+            if let Some(id) = parse_sst_id(&name.to_string_lossy()) {
+                sst_ids.push(id);
+            }
+        }
+        sst_ids.sort_unstable();
+        let next_sst_id = sst_ids.last().map_or(0, |&id| id + 1);
+
+        let mut manifest = Manifest::create(dir)?;
+        let mut edits = vec![VersionEdit::SetNextSstId(next_sst_id)];
+        edits.extend(sst_ids.iter().map(|&id| VersionEdit::AddTable { id }));
+        manifest.append_batch(&edits)?;
+
+        let state = ManifestState {
+            live_tables: sst_ids.into_iter().collect(),
+            next_seq: 0,
+            next_sst_id,
+        };
+        Ok((manifest, state))
     }
 
     /// Insert or overwrite `key` with `value`.
@@ -156,6 +198,15 @@ impl Db {
         let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
         self.sstables.push(SsTable { id, reader });
         self.next_sst_id += 1;
+
+        // Record the new table in the manifest *before* truncating the WAL:
+        // the WAL still backs these records until the manifest makes the
+        // SSTable authoritative.
+        self.manifest.append_batch(&[
+            VersionEdit::AddTable { id },
+            VersionEdit::SetNextSstId(self.next_sst_id),
+            VersionEdit::SetNextSeq(self.next_seq),
+        ])?;
 
         // The flushed data is now durable in the SSTable; reset WAL + MemTable.
         self.wal = Wal::create(self.dir.join(WAL_FILENAME), self.opts.sync_wal)?;
@@ -205,8 +256,16 @@ impl Db {
             fs::rename(&tmp_path, &final_path)?;
             let stale_ids: Vec<u64> =
                 self.sstables[start..end - 1].iter().map(|t| t.id).collect();
-            for id in stale_ids {
-                fs::remove_file(sst_path(&self.dir, id))?;
+            // Drop the stale inputs from the manifest before unlinking them, so
+            // a crash mid-cleanup leaves them as reclaimable orphans.
+            self.manifest.append_batch(
+                &stale_ids
+                    .iter()
+                    .map(|&id| VersionEdit::DeleteTable { id })
+                    .collect::<Vec<_>>(),
+            )?;
+            for id in &stale_ids {
+                fs::remove_file(sst_path(&self.dir, *id))?;
             }
 
             let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
@@ -446,6 +505,46 @@ mod tests {
         db.flush().unwrap();
         assert_eq!(db.get(b"k").unwrap(), Some(b"v2".to_vec()));
         assert_eq!(db.get(b"gone").unwrap(), None);
+    }
+
+    #[test]
+    fn open_creates_manifest_and_reclaims_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = Db::open_with(dir.path(), fast_opts()).unwrap();
+            db.put(b"k", b"v").unwrap();
+            db.flush().unwrap();
+        }
+        assert!(dir.path().join("CURRENT").exists());
+
+        // A stray SSTable not named by the manifest must be reclaimed on open.
+        let orphan = dir.path().join("sst_0000009999.db");
+        fs::copy(sst_path(dir.path(), 0), &orphan).unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        assert!(!orphan.exists());
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn migrates_phase2_directory_without_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = Db::open_with(dir.path(), fast_opts()).unwrap();
+            db.put(b"old", b"data").unwrap();
+            db.flush().unwrap();
+        }
+        // Simulate a Phase 2 layout: drop the manifest, keep the SSTable.
+        fs::remove_file(dir.path().join("CURRENT")).unwrap();
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            if name.to_string_lossy().starts_with("MANIFEST-") {
+                fs::remove_file(dir.path().join(name)).unwrap();
+            }
+        }
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        assert!(dir.path().join("CURRENT").exists());
+        assert_eq!(db.get(b"old").unwrap(), Some(b"data".to_vec()));
+        assert_eq!(db.sstable_count(), 1);
     }
 
     #[test]

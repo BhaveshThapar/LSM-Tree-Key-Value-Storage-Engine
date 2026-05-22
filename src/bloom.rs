@@ -37,10 +37,7 @@ impl BloomFilter {
     }
 
     fn hashes(&self, key: &[u8]) -> (u64, u64) {
-        (
-            xxh3_64_with_seed(key, 0),
-            xxh3_64_with_seed(key, 1),
-        )
+        (xxh3_64_with_seed(key, 0), xxh3_64_with_seed(key, 1))
     }
 
     /// Record `key` as a member.

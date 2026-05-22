@@ -47,7 +47,11 @@ fn sample_zipf(cdf: &[f64], rng: &mut StdRng) -> u64 {
 /// Generate `N_OPS` operations with the given read fraction and distribution.
 fn workload(read_frac: f64, zipfian: bool, seed: u64) -> Vec<Op> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let cdf = if zipfian { zipf_cdf(N_KEYS) } else { Vec::new() };
+    let cdf = if zipfian {
+        zipf_cdf(N_KEYS)
+    } else {
+        Vec::new()
+    };
     (0..N_OPS)
         .map(|_| {
             let k = if zipfian {

@@ -233,9 +233,7 @@ fn replay(path: &Path) -> Result<ManifestState> {
         Ok(mut f) => {
             f.read_to_end(&mut bytes)?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ManifestState::default())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ManifestState::default()),
         Err(e) => return Err(e.into()),
     }
 

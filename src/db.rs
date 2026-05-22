@@ -455,8 +455,7 @@ impl DbInner {
         let _compaction_guard = self.compaction_lock.lock();
 
         let tables = self.sstables.read().clone();
-        let Some((start, end)) = pick_compaction(&tables, self.opts.compaction_threshold)?
-        else {
+        let Some((start, end)) = pick_compaction(&tables, self.opts.compaction_threshold)? else {
             return Ok(false);
         };
         let run: Vec<Arc<SsTable>> = tables[start..end].to_vec();
@@ -530,10 +529,7 @@ fn worker_loop(rx: Receiver<Task>, inner: Weak<DbInner>) {
 
 /// Pick a contiguous, id-ordered run of `threshold`+ SSTables that fall in the
 /// same size tier, returning its `start..end` range.
-fn pick_compaction(
-    tables: &[Arc<SsTable>],
-    threshold: usize,
-) -> Result<Option<(usize, usize)>> {
+fn pick_compaction(tables: &[Arc<SsTable>], threshold: usize) -> Result<Option<(usize, usize)>> {
     if tables.len() < threshold {
         return Ok(None);
     }

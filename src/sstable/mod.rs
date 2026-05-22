@@ -52,10 +52,10 @@ impl SsTableWriter {
         let mut block_first_key: Vec<u8> = Vec::new();
 
         let flush_block = |block: &mut Vec<u8>,
-                               first_key: &mut Vec<u8>,
-                               w: &mut BufWriter<File>,
-                               offset: &mut u64,
-                               index: &mut Vec<(Vec<u8>, u64, u32)>|
+                           first_key: &mut Vec<u8>,
+                           w: &mut BufWriter<File>,
+                           offset: &mut u64,
+                           index: &mut Vec<(Vec<u8>, u64, u32)>|
          -> Result<()> {
             if block.is_empty() {
                 return Ok(());
@@ -80,10 +80,22 @@ impl SsTableWriter {
                 .get(i + 1)
                 .map_or(true, |next| next.key != record.key);
             if block.len() >= BLOCK_SIZE && next_differs {
-                flush_block(&mut block, &mut block_first_key, &mut w, &mut offset, &mut index)?;
+                flush_block(
+                    &mut block,
+                    &mut block_first_key,
+                    &mut w,
+                    &mut offset,
+                    &mut index,
+                )?;
             }
         }
-        flush_block(&mut block, &mut block_first_key, &mut w, &mut offset, &mut index)?;
+        flush_block(
+            &mut block,
+            &mut block_first_key,
+            &mut w,
+            &mut offset,
+            &mut index,
+        )?;
 
         let index_offset = offset;
         for (key, block_offset, comp_len) in &index {
@@ -265,7 +277,10 @@ impl SsTableReader {
         if self.bloom_enabled && !self.bloom.contains(key) {
             return Ok(None);
         }
-        let block_idx = match self.index.binary_search_by(|(k, _, _)| k.as_slice().cmp(key)) {
+        let block_idx = match self
+            .index
+            .binary_search_by(|(k, _, _)| k.as_slice().cmp(key))
+        {
             Ok(i) => i,
             Err(0) => return Ok(None), // key precedes the first key in the table
             Err(i) => i - 1,
@@ -336,7 +351,13 @@ mod tests {
     fn write_then_point_lookup() {
         // Large values force many blocks so lookups cross block boundaries.
         let recs: Vec<_> = (0u32..2000)
-            .map(|i| Record::put(format!("key{i:05}").into_bytes(), vec![i as u8; 64], i as u64))
+            .map(|i| {
+                Record::put(
+                    format!("key{i:05}").into_bytes(),
+                    vec![i as u8; 64],
+                    i as u64,
+                )
+            })
             .collect();
         let (_d, r) = write_table(&recs);
         assert_eq!(r.record_count(), 2000);

@@ -34,7 +34,8 @@ fn run_child_if_requested() {
     for i in 0u64.. {
         let key = format!("key{i:08}");
         let value = format!("value-for-{i}-padded-padded-padded");
-        db.put(key.as_bytes(), value.as_bytes()).expect("child: put");
+        db.put(key.as_bytes(), value.as_bytes())
+            .expect("child: put");
         let mut lock = stdout.lock();
         writeln!(lock, "ACK {i}").unwrap();
         lock.flush().unwrap();

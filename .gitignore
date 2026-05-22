@@ -3,3 +3,10 @@
 *.wal
 /test-data
 /bench-data
+
+# cargo-fuzz
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock

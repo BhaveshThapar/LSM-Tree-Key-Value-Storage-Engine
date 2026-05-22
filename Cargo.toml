@@ -20,6 +20,11 @@ tempfile = "3"
 criterion = "0.5"
 rocksdb = "0.22"
 rand = "0.8"
+proptest = "1"
+
+[features]
+# Re-exports internal decoders for the `fuzz/` cargo-fuzz crate.
+fuzzing = []
 
 [[bench]]
 name = "engine"

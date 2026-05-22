@@ -26,4 +26,30 @@ mod sstable;
 mod wal;
 
 pub use db::{Db, Options, Snapshot};
+
+/// Internal decoders exposed for fuzzing only (`--features fuzzing`).
+///
+/// Every entry point here must reject arbitrary bytes with an `Err` rather
+/// than panicking; the `fuzz/` crate asserts exactly that.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use crate::Result;
+    use std::path::Path;
+
+    /// Decode a single [`Record`](crate::record::Record) from raw bytes.
+    pub fn decode_record(bytes: &[u8]) -> Result<()> {
+        let mut pos = 0;
+        crate::record::Record::decode_at(bytes, &mut pos).map(|_| ())
+    }
+
+    /// Replay a WAL file holding arbitrary bytes.
+    pub fn replay_wal(path: &Path) -> Result<()> {
+        crate::wal::Wal::replay(path).map(|_| ())
+    }
+
+    /// Open an SSTable file holding arbitrary bytes.
+    pub fn open_sstable(path: &Path) -> Result<()> {
+        crate::sstable::SsTableReader::open(path, true).map(|_| ())
+    }
+}
 pub use error::{Error, Result};

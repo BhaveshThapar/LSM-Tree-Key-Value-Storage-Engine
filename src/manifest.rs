@@ -5,7 +5,10 @@
 //! model. On open the log is replayed into a [`ManifestState`], then rolled
 //! over into a fresh, compacted generation so the file never grows unbounded.
 //!
-//! Frame layout mirrors the WAL: `[crc32:4][payload_len:4][payload]`, where
+//! File layout mirrors the WAL: an eight-byte [header](crate::header), then
+//! frames.
+//!
+//! Frame layout: `[crc32:4][payload_len:4][payload]`, where
 //! `payload` is `[edit_tag:1][body:8]` (all little-endian). A torn trailing
 //! frame is tolerated exactly like [`Wal::replay`](crate::wal).
 //!
@@ -18,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::fs::{BufAppend, File as _, Fs, OpenMode};
+use crate::header::{self, Kind, MANIFEST_MAGIC};
 
 const CURRENT_FILENAME: &str = "CURRENT";
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
@@ -130,14 +134,16 @@ impl<F: Fs> Manifest<F> {
     pub fn create(fs: &F, dir: &Path) -> Result<Manifest<F>> {
         let generation = 0;
         let path = manifest_path(dir, generation);
-        let mut file = fs.open(&path, OpenMode::Truncate)?;
-        file.sync()?;
-        write_current(fs, dir, generation)?;
-        Ok(Manifest {
+        let file = fs.open(&path, OpenMode::Truncate)?;
+        let mut manifest = Manifest {
             dir: dir.to_path_buf(),
             generation,
             file: BufAppend::new(file),
-        })
+        };
+        manifest.file.write(&header::encode(MANIFEST_MAGIC))?;
+        manifest.file.sync()?;
+        write_current(fs, dir, generation)?;
+        Ok(manifest)
     }
 
     /// Append a batch of edits and fsync them as a unit.
@@ -165,6 +171,7 @@ impl<F: Fs> Manifest<F> {
             generation: new_gen,
             file: BufAppend::new(fs.open(&new_path, OpenMode::Truncate)?),
         };
+        writer.file.write(&header::encode(MANIFEST_MAGIC))?;
         writer.append_batch(&state.snapshot_edits())?;
 
         // Atomic publish: CURRENT now names the new, durable generation.
@@ -215,8 +222,15 @@ fn replay<F: Fs>(fs: &F, path: &Path) -> Result<ManifestState> {
         Err(e) => return Err(e.into()),
     };
 
+    let kind = header::classify(&bytes, MANIFEST_MAGIC, "the manifest")?;
+    if kind == Kind::Empty {
+        return Ok(ManifestState::default());
+    }
+
     let mut state = ManifestState::default();
-    let mut pos = 0;
+    let first_frame = header::frames_start(kind);
+    let mut pos = first_frame;
+    let mut frames = 0usize;
     while pos + FRAME_HEADER <= bytes.len() {
         let crc = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
@@ -230,7 +244,32 @@ fn replay<F: Fs>(fs: &F, path: &Path) -> Result<ManifestState> {
             break; // corrupt trailing frame
         }
         state.apply(VersionEdit::decode(payload)?);
+        frames += 1;
         pos = end;
+    }
+
+    // A manifest with bytes in it and not one readable frame is corrupt, and
+    // saying so here is the point of this whole module.
+    //
+    // The reclamation loop on open deletes every SSTable the manifest does not
+    // name, so a manifest read as empty is not a failed open — it is a
+    // successful one that takes the database with it. Tolerating a torn
+    // *trailing* frame is right, because that is what a crash mid-append looks
+    // like. Tolerating a file where even the first frame does not verify is
+    // not: the engine rolls the manifest over on every open, so a live one
+    // always holds at least the snapshot edits, and zero readable frames is a
+    // state this engine never produces.
+    //
+    // The WAL deliberately has no equivalent check. A fresh WAL followed by a
+    // crash during its first append leaves exactly this shape, and there it
+    // really does mean "no records".
+    if frames == 0 && bytes.len() > first_frame {
+        return Err(Error::Corrupt(format!(
+            "{} holds {} bytes and not one readable frame; refusing to treat it as empty, \
+             because doing so would reclaim every SSTable in the directory",
+            path.display(),
+            bytes.len() - first_frame
+        )));
     }
     Ok(state)
 }
@@ -297,12 +336,15 @@ mod tests {
         assert!(manifest_path(dir.path(), 1).exists());
     }
 
+    /// A crash mid-append leaves the last frame torn. Everything before it is
+    /// still good and is still read.
     #[test]
     fn torn_trailing_frame_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut m = Manifest::create(&StdFs, dir.path()).unwrap();
             m.append_batch(&[VersionEdit::AddTable { id: 7 }]).unwrap();
+            m.append_batch(&[VersionEdit::AddTable { id: 8 }]).unwrap();
         }
         let path = manifest_path(dir.path(), 0);
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -311,6 +353,90 @@ mod tests {
         f.sync_all().unwrap();
 
         let state = replay(&StdFs, &path).unwrap();
-        assert!(state.live_tables.is_empty());
+        assert_eq!(
+            state.live_tables.iter().copied().collect::<Vec<_>>(),
+            vec![7],
+            "the intact frame before the torn one was lost"
+        );
+    }
+
+    /// The whole reason this file has a header. A manifest with bytes in it and
+    /// not one readable frame is refused — because the alternative is a
+    /// *successful* open that decides every SSTable in the directory is an
+    /// orphan and deletes it.
+    #[test]
+    fn a_manifest_with_no_readable_frame_is_refused_rather_than_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut m = Manifest::create(&StdFs, dir.path()).unwrap();
+            m.append_batch(&[VersionEdit::AddTable { id: 7 }]).unwrap();
+        }
+        let path = manifest_path(dir.path(), 0);
+        // Cut the one frame short: exactly the shape a foreign or
+        // wrong-version file replays to.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(header::HEADER_LEN as u64 + 3).unwrap();
+        f.sync_all().unwrap();
+
+        let err = replay(&StdFs, &path).unwrap_err();
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "a manifest with no readable frame gave {err:?} rather than Corrupt"
+        );
+    }
+
+    /// A file holding nothing but a header is a manifest that was created and
+    /// not yet written to. That is empty, not corrupt.
+    #[test]
+    fn a_header_and_nothing_else_is_an_empty_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = manifest_path(dir.path(), 0);
+        drop(Manifest::create(&StdFs, dir.path()).unwrap());
+        assert_eq!(
+            StdFs.size(&path).unwrap(),
+            header::HEADER_LEN as u64,
+            "create wrote more than a header"
+        );
+        assert!(replay(&StdFs, &path).unwrap().live_tables.is_empty());
+    }
+
+    /// A manifest written before headers existed still opens, and comes back
+    /// with a header once the open has rolled it over.
+    #[test]
+    fn a_headerless_manifest_still_replays_and_is_rewritten_with_a_header() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build one by hand in the old layout: frames from offset zero.
+        let path = manifest_path(dir.path(), 0);
+        {
+            let mut bytes = Vec::new();
+            for edit in [
+                VersionEdit::SetNextSstId(3),
+                VersionEdit::AddTable { id: 2 },
+            ] {
+                let payload = edit.encode();
+                bytes.extend(crc32fast::hash(&payload).to_le_bytes());
+                bytes.extend((payload.len() as u32).to_le_bytes());
+                bytes.extend(payload);
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            std::fs::write(dir.path().join(CURRENT_FILENAME), b"MANIFEST-000000\n").unwrap();
+        }
+
+        let state = replay(&StdFs, &path).unwrap();
+        assert_eq!(state.next_sst_id, 3);
+        assert_eq!(
+            state.live_tables.iter().copied().collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        // Opening rolls it over, and the new generation carries a header.
+        let (_m, opened) = Manifest::open(&StdFs, dir.path()).unwrap();
+        assert_eq!(opened.next_sst_id, 3);
+        let rolled = std::fs::read(manifest_path(dir.path(), 1)).unwrap();
+        assert_eq!(
+            &rolled[0..4],
+            MANIFEST_MAGIC,
+            "the rollover did not write a header"
+        );
     }
 }

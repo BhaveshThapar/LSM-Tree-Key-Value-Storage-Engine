@@ -21,6 +21,7 @@ mod db;
 mod error;
 pub mod fs;
 mod fsutil;
+mod header;
 mod manifest;
 mod memtable;
 mod record;

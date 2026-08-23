@@ -26,7 +26,7 @@ mod record;
 mod sstable;
 mod wal;
 
-pub use db::{Db, Options, Snapshot};
+pub use db::{Db, Maintenance, Options, Snapshot};
 
 /// Internal decoders exposed for fuzzing only (`--features fuzzing`).
 ///

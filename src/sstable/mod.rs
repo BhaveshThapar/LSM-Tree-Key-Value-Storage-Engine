@@ -151,10 +151,10 @@ impl BlockCache {
         if self.map.contains_key(&offset) {
             return;
         }
-        if self.order.len() >= BLOCK_CACHE_CAP {
-            if let Some(evicted) = self.order.pop_front() {
-                self.map.remove(&evicted);
-            }
+        if self.order.len() >= BLOCK_CACHE_CAP
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.map.remove(&evicted);
         }
         self.map.insert(offset, block);
         self.order.push_back(offset);

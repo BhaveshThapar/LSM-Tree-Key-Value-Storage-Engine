@@ -4,7 +4,7 @@
 //! uniform and a Zipfian key distribution. One harness drives both engines so
 //! the throughput numbers are directly comparable.
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use lsm_kv::{Db, Options};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -40,7 +40,7 @@ fn zipf_cdf(n: u64) -> Vec<f64> {
 }
 
 fn sample_zipf(cdf: &[f64], rng: &mut StdRng) -> u64 {
-    let u: f64 = rng.gen();
+    let u: f64 = rng.r#gen();
     cdf.partition_point(|&c| c < u) as u64
 }
 
@@ -59,7 +59,7 @@ fn workload(read_frac: f64, zipfian: bool, seed: u64) -> Vec<Op> {
             } else {
                 rng.gen_range(0..N_KEYS)
             };
-            if rng.gen::<f64>() < read_frac {
+            if rng.r#gen::<f64>() < read_frac {
                 Op::Read(k)
             } else {
                 Op::Write(k)

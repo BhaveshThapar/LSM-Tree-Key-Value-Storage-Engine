@@ -1,7 +1,7 @@
 //! Microbenchmarks for the `lsm_kv` engine in isolation: write throughput,
 //! hot/cold point reads, the Bloom-filter read win, and post-compaction reads.
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use lsm_kv::{Db, Options};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

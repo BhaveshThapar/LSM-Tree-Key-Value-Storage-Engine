@@ -16,7 +16,6 @@ const FRAME_HEADER: usize = 8; // crc32 + payload_len
 /// An append-only write-ahead log bound to a single active MemTable.
 pub struct Wal {
     file: BufWriter<File>,
-    #[allow(dead_code)] // surfaced via path(); used by Phase 3 recovery tooling
     path: PathBuf,
     sync: bool,
 }
@@ -24,8 +23,10 @@ pub struct Wal {
 impl Wal {
     /// Create a *fresh* WAL at `path`, truncating any existing file.
     ///
-    /// Use this only after a flush, once the prior WAL's records are durably
-    /// in an SSTable — truncating before that would discard recovered data.
+    /// Only ever called on a scratch path. Pointing it at the live `wal.log`
+    /// would truncate a file that is still the only durable home of every write
+    /// acknowledged since the last freeze; the flush path builds the
+    /// replacement beside it and renames it into place instead.
     pub fn create(path: impl Into<PathBuf>, sync: bool) -> Result<Wal> {
         let path = path.into();
         let file = OpenOptions::new()
@@ -71,6 +72,28 @@ impl Wal {
         if self.sync {
             self.file.get_ref().sync_all()?;
         }
+        Ok(())
+    }
+
+    /// Make everything appended so far durable, regardless of `sync`.
+    ///
+    /// `append` only fsyncs when the WAL was opened with `sync`, so a caller
+    /// about to publish this file by rename has to ask explicitly: the rename
+    /// would otherwise make a file visible whose contents may not be on disk.
+    pub fn sync(&mut self) -> Result<()> {
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+        Ok(())
+    }
+
+    /// Rename this WAL to `dest`, taking the new path with it.
+    ///
+    /// The open descriptor follows the inode, so appends after this land in the
+    /// renamed file.
+    pub fn rename_to(&mut self, dest: impl AsRef<Path>) -> Result<()> {
+        let dest = dest.as_ref();
+        std::fs::rename(&self.path, dest)?;
+        self.path = dest.to_path_buf();
         Ok(())
     }
 

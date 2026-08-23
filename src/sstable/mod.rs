@@ -19,7 +19,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::bloom::BloomFilter;
 use crate::error::{Error, Result};
@@ -76,9 +78,7 @@ impl SsTableWriter {
             record.encode_into(&mut block);
             // Never split a key's versions across blocks: a seq-aware lookup
             // scans only the one block the binary search lands on.
-            let next_differs = records
-                .get(i + 1)
-                .map_or(true, |next| next.key != record.key);
+            let next_differs = records.get(i + 1).is_none_or(|next| next.key != record.key);
             if block.len() >= BLOCK_SIZE && next_differs {
                 flush_block(
                     &mut block,
@@ -242,7 +242,7 @@ impl SsTableReader {
     /// Decompress and decode the data block at `block_offset`/`comp_len`,
     /// returning it through the block cache.
     fn load_block(&self, block_offset: u64, comp_len: u32) -> Result<Arc<Vec<Record>>> {
-        if let Some(block) = self.cache.lock().unwrap().get(block_offset) {
+        if let Some(block) = self.cache.lock().get(block_offset) {
             return Ok(block);
         }
         let mut comp = vec![0u8; comp_len as usize];
@@ -255,7 +255,7 @@ impl SsTableReader {
             records.push(Record::decode_at(&raw, &mut pos)?);
         }
         let block = Arc::new(records);
-        self.cache.lock().unwrap().put(block_offset, block.clone());
+        self.cache.lock().put(block_offset, block.clone());
         Ok(block)
     }
 

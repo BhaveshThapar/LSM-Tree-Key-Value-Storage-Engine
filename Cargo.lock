@@ -528,6 +528,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "criterion",
+ "libc",
  "lz4_flex",
  "parking_lot",
  "proptest",

@@ -20,6 +20,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::compaction;
 use crate::compactor::{self, CompactMsg};
 use crate::error::Result;
+use crate::fsutil::{self, DirLock};
 use crate::manifest::{Manifest, ManifestState, VersionEdit};
 use crate::memtable::{MemTable, DEFAULT_THRESHOLD};
 use crate::record::Record;
@@ -27,6 +28,8 @@ use crate::sstable::{SsTableReader, SsTableWriter};
 use crate::wal::Wal;
 
 const WAL_FILENAME: &str = "wal.log";
+/// Scratch path for a WAL rewrite, published by rename.
+const WAL_TMP_FILENAME: &str = "wal.log.tmp";
 
 /// Tuning knobs for opening a database.
 #[derive(Debug, Clone)]
@@ -92,6 +95,8 @@ impl Drop for Workers {
 pub(crate) struct DbInner {
     dir: PathBuf,
     opts: Options,
+    /// Held for the lifetime of the handle; released when it is dropped.
+    _lock: DirLock,
     /// Serializes WAL appends; also held across the matching MemTable insert
     /// so a record is never visible in one without the other.
     wal: Mutex<Wal>,
@@ -118,6 +123,8 @@ pub(crate) struct DbInner {
     worker_tx: Sender<Task>,
     /// Triggers background compaction.
     compact_tx: Sender<CompactMsg>,
+    /// Latched first failure. Set once and never cleared: see [`Error::Poisoned`].
+    failed: RwLock<Option<Arc<crate::error::Error>>>,
 }
 
 /// An embedded LSM-tree key/value store.
@@ -141,6 +148,14 @@ impl Db {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
+        // Before anything else. Everything below this line either mutates the
+        // directory or deletes from it — the manifest rolls its generation
+        // forward and unlinks the old one, and the reclamation loop removes
+        // every SSTable the manifest does not name. A second handle running the
+        // same sequence concurrently would delete this one's files, and this
+        // one would delete its files back.
+        let lock = DirLock::acquire(&dir)?;
+
         // The manifest is the authoritative record of the live SSTable set and
         // the global counters. If absent, migrate a Phase 2 directory by
         // scanning its `sst_*.db` files into a fresh manifest.
@@ -152,14 +167,18 @@ impl Db {
 
         // Reclaim orphan SSTables: any `sst_*.db` not named by the manifest is
         // a leftover from a crash before its `AddTable` edit was durable.
+        let lock_name = fsutil::lock_path(&dir);
         for entry in fs::read_dir(&dir)? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
+            if dir.join(name.as_ref()) == lock_name {
+                continue;
+            }
             if let Some(id) = parse_sst_id(&name) {
                 if !state.live_tables.contains(&id) {
                     fs::remove_file(dir.join(name.as_ref()))?;
                 }
-            } else if name.ends_with(".db.tmp") {
+            } else if name.ends_with(".db.tmp") || name == WAL_TMP_FILENAME {
                 fs::remove_file(dir.join(name.as_ref()))?;
             }
         }
@@ -194,6 +213,7 @@ impl Db {
         let inner = Arc::new(DbInner {
             dir,
             opts,
+            _lock: lock,
             wal: Mutex::new(wal),
             active: RwLock::new(memtable),
             frozen: RwLock::new(None),
@@ -206,6 +226,7 @@ impl Db {
             snapshots: Mutex::new(BTreeMap::new()),
             worker_tx: flush_tx.clone(),
             compact_tx: compact_tx.clone(),
+            failed: RwLock::new(None),
         });
 
         let flush_weak = Arc::downgrade(&inner);
@@ -275,6 +296,17 @@ impl Db {
         Ok(())
     }
 
+    /// `Err` once a flush or a compaction has failed.
+    ///
+    /// The engine does not recover in-process: a failed flush leaves the frozen
+    /// MemTable stranded and the WAL un-rewritten, so everything written after
+    /// it is building on state that will not survive a restart. A caller that
+    /// replicates — or that simply wants to fail loudly rather than quietly —
+    /// should poll this and reopen the directory.
+    pub fn health(&self) -> Result<()> {
+        self.inner.health()
+    }
+
     /// Number of immutable SSTables currently on disk.
     pub fn sstable_count(&self) -> usize {
         self.inner.sstables.read().len()
@@ -322,8 +354,34 @@ impl Drop for Snapshot {
 }
 
 impl DbInner {
+    /// Latch the first failure and return the error every later call will see.
+    ///
+    /// Only the first is kept: everything after it is a consequence, and the
+    /// first one is the one that says what went wrong.
+    fn fail(&self, e: crate::error::Error) -> crate::error::Error {
+        let mut slot = self.failed.write();
+        if slot.is_none() {
+            eprintln!("lsm: engine failed and will not recover in this process: {e}");
+            *slot = Some(Arc::new(e));
+        }
+        crate::error::Error::Poisoned(
+            slot.as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        )
+    }
+
+    /// `Err` once a flush or a compaction has failed.
+    pub(crate) fn health(&self) -> Result<()> {
+        match self.failed.read().as_ref() {
+            Some(e) => Err(crate::error::Error::Poisoned(e.to_string())),
+            None => Ok(()),
+        }
+    }
+
     /// Append a mutation to the WAL and the active MemTable.
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<()> {
+        self.health()?;
         let trigger_flush;
         {
             // Hold the WAL lock across the MemTable insert so the record's WAL
@@ -350,6 +408,11 @@ impl DbInner {
     /// SSTables newest-to-oldest. Only records with `seq < seq_bound` are
     /// visible — `u64::MAX` resolves the latest value.
     fn get_at(&self, key: &[u8], seq_bound: u64) -> Result<Option<Vec<u8>>> {
+        // Reads refuse as well as writes. A handle whose flush failed is
+        // serving from a MemTable whose contents are not going to survive a
+        // restart, and answering a read from it is a durability claim the
+        // engine can no longer make.
+        self.health()?;
         if let Some(record) = self.active.read().get_at(key, seq_bound) {
             return Ok(record.value.clone());
         }
@@ -382,6 +445,11 @@ impl DbInner {
     /// Freeze the active MemTable, write it to a new SSTable, publish it, and
     /// rewrite the WAL to back only the records written since the freeze.
     fn flush_inner(&self) -> Result<()> {
+        self.health()?;
+        self.flush_impl().map_err(|e| self.fail(e))
+    }
+
+    fn flush_impl(&self) -> Result<()> {
         let _flush_guard = self.flush_lock.lock();
 
         // Freeze: swap the active MemTable for a fresh one. The frozen slot is
@@ -405,7 +473,11 @@ impl DbInner {
         let records: Vec<Record> = frozen.iter().cloned().collect();
         SsTableWriter::write(&tmp_path, &records)?;
         // Atomic publish: a crash before the rename leaves only a stale .tmp.
+        // The writer already fsynced the file's contents; this makes its *name*
+        // durable, which is a separate thing and the one the manifest is about
+        // to depend on.
         fs::rename(&tmp_path, &final_path)?;
+        fsutil::sync_dir(&self.dir)?;
         let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
 
         // Record the new table in the manifest *before* truncating the WAL:
@@ -430,13 +502,22 @@ impl DbInner {
         // Rewrite the WAL to back only the records written since the freeze.
         // Holding the WAL lock blocks appends — but they already serialize on
         // it — and `active` now holds exactly those post-freeze records.
+        //
+        // Built beside the live WAL and renamed over it. Truncating the live
+        // file in place would destroy the only durable copy of every write
+        // acknowledged since the freeze, for as long as it took to write them
+        // back — a window proportional to how much was written under load.
         {
             let mut wal = self.wal.lock();
             let active = self.active.read();
-            let mut fresh = Wal::create(self.dir.join(WAL_FILENAME), self.opts.sync_wal)?;
+            let tmp_path = self.dir.join(WAL_TMP_FILENAME);
+            let mut fresh = Wal::create(&tmp_path, self.opts.sync_wal)?;
             for record in active.iter() {
                 fresh.append(record)?;
             }
+            fresh.sync()?;
+            fresh.rename_to(self.dir.join(WAL_FILENAME))?;
+            fsutil::sync_dir(&self.dir)?;
             *wal = fresh;
         }
         *self.frozen.write() = None;
@@ -452,6 +533,11 @@ impl DbInner {
     /// The heavy merge writes the output SSTable without any lock held; only
     /// the publish step takes `flush_lock`, so flushes proceed concurrently.
     pub(crate) fn compact_step(&self) -> Result<bool> {
+        self.health()?;
+        self.compact_step_impl().map_err(|e| self.fail(e))
+    }
+
+    fn compact_step_impl(&self) -> Result<bool> {
         let _compaction_guard = self.compaction_lock.lock();
 
         let tables = self.sstables.read().clone();
@@ -461,7 +547,10 @@ impl DbInner {
         let run: Vec<Arc<SsTable>> = tables[start..end].to_vec();
         // The merged table reuses the run's highest id, keeping it in the same
         // position in the live set; the manifest makes the swap crash-safe.
-        let max_id = run.last().unwrap().id;
+        let Some(last) = run.last() else {
+            return Ok(false);
+        };
+        let max_id = last.id;
         let drop_tombstones = run[0].id == tables[0].id;
 
         // Read the snapshot horizon once: new snapshots only take a larger
@@ -480,6 +569,9 @@ impl DbInner {
         {
             let _flush_guard = self.flush_lock.lock();
             fs::rename(&tmp_path, &final_path)?;
+            // Before the DeleteTable edits below: the merged output has to be
+            // durable at its name before the manifest says its inputs are gone.
+            fsutil::sync_dir(&self.dir)?;
             let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
 
             let stale_ids: Vec<u64> = run[..run.len() - 1].iter().map(|t| t.id).collect();
@@ -493,10 +585,11 @@ impl DbInner {
             // A concurrent flush only appends, so the run is still a contiguous
             // block ending at `max_id`.
             let cur = self.sstables.read().clone();
-            let end_pos = cur
-                .iter()
-                .position(|t| t.id == max_id)
-                .expect("compacted run vanished from the live set");
+            let end_pos = cur.iter().position(|t| t.id == max_id).ok_or_else(|| {
+                crate::error::Error::Corrupt(format!(
+                    "compacted run vanished from the live set: sst {max_id}"
+                ))
+            })?;
             let start_pos = end_pos + 1 - run.len();
             let mut next = Vec::with_capacity(cur.len() - run.len() + 1);
             next.extend(cur[..start_pos].iter().cloned());
@@ -507,6 +600,9 @@ impl DbInner {
             for id in &stale_ids {
                 fs::remove_file(sst_path(&self.dir, *id))?;
             }
+            // Hygiene only, and one fsync for the whole batch: a lost unlink is
+            // a space leak the next open reclaims, not a correctness problem.
+            fsutil::sync_dir(&self.dir)?;
         }
         Ok(true)
     }
@@ -519,8 +615,10 @@ fn worker_loop(rx: Receiver<Task>, inner: Weak<DbInner>) {
             Task::Shutdown => break,
             Task::Flush => {
                 let Some(inner) = inner.upgrade() else { break };
-                if let Err(e) = inner.flush_inner() {
-                    eprintln!("lsm: background flush failed: {e}");
+                if inner.flush_inner().is_err() {
+                    // flush_inner has latched it. Continuing would retry a
+                    // flush that cannot succeed, once per write, forever.
+                    break;
                 }
             }
         }
@@ -565,6 +663,7 @@ fn parse_sst_id(name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     fn fast_opts() -> Options {
         Options {
@@ -731,7 +830,10 @@ mod tests {
                 );
             }
         }
-        // Survives reopen.
+        // Survives reopen. The first handle has to go first: shadowing the
+        // binding does not drop it, and two live handles on one directory
+        // reclaim each other's SSTables.
+        drop(db);
         let db = Db::open_with(dir.path(), fast_opts()).unwrap();
         assert_eq!(
             db.get(b"k2_0100").unwrap(),
@@ -917,6 +1019,125 @@ mod tests {
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v3".to_vec()));
         assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    /// The fix is an ordering property, and this is the observable half of it:
+    /// if the live WAL were still being truncated in place, its inode would
+    /// survive the flush. A rename gives the name a different inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_publishes_a_new_wal_rather_than_truncating_the_live_one() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        db.put(b"a", b"1").unwrap();
+
+        let wal = dir.path().join(WAL_FILENAME);
+        let before = std::fs::metadata(&wal).unwrap().ino();
+
+        db.flush().unwrap();
+        db.put(b"b", b"2").unwrap();
+
+        let after = std::fs::metadata(&wal).unwrap().ino();
+        assert_ne!(
+            before, after,
+            "the live WAL was truncated in place, which loses every write \
+             acknowledged since the freeze if the process dies mid-rewrite"
+        );
+        assert!(
+            !dir.path().join(WAL_TMP_FILENAME).exists(),
+            "the scratch file should have been renamed away, not left behind"
+        );
+
+        drop(db);
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn a_stale_wal_scratch_file_is_reclaimed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+            db.put(b"k", b"v").unwrap();
+        }
+        // A crash between creating the scratch WAL and renaming it leaves this.
+        std::fs::write(dir.path().join(WAL_TMP_FILENAME), b"garbage").unwrap();
+
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert!(!dir.path().join(WAL_TMP_FILENAME).exists());
+    }
+
+    #[test]
+    fn a_failed_flush_poisons_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        // Occupy the path the flush will write its SSTable to, with something
+        // File::create cannot open.
+        std::fs::create_dir(sst_path(dir.path(), 0).with_extension("db.tmp")).unwrap();
+
+        assert!(db.flush().is_err());
+
+        // The frozen MemTable is stranded and the WAL was never rewritten.
+        // Continuing to accept writes would build on state that is not going to
+        // survive a restart, so every entry point refuses from here on.
+        assert!(matches!(db.health(), Err(Error::Poisoned(_))));
+        assert!(matches!(db.put(b"k2", b"v"), Err(Error::Poisoned(_))));
+        assert!(matches!(db.delete(b"k"), Err(Error::Poisoned(_))));
+        assert!(matches!(db.get(b"k"), Err(Error::Poisoned(_))));
+        assert!(matches!(db.flush(), Err(Error::Poisoned(_))));
+    }
+
+    #[test]
+    fn only_the_first_failure_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+
+        db.inner.fail(Error::Corrupt("first".into()));
+        db.inner.fail(Error::Corrupt("second".into()));
+
+        // Everything after the first is a consequence of it.
+        match db.health() {
+            Err(Error::Poisoned(msg)) => assert!(msg.contains("first"), "got {msg}"),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_open_of_a_live_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        // Without this, the second open rolls the manifest forward, deletes the
+        // first handle's generation, and reclaims its SSTables as orphans.
+        match Db::open(dir.path()) {
+            Err(crate::error::Error::Locked(_)) => {}
+            other => panic!("expected Locked, got {:?}", other.map(|_| "Db")),
+        }
+
+        drop(db);
+        let reopened = Db::open(dir.path()).expect("the lock is released on drop");
+        assert_eq!(reopened.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn the_lock_file_is_not_reclaimed_as_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path()).unwrap();
+            db.put(b"k", b"v").unwrap();
+            db.flush().unwrap();
+        }
+        // Reopening runs the reclamation loop, which must leave LOCK alone.
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert!(crate::fsutil::lock_path(dir.path()).exists());
     }
 
     #[test]

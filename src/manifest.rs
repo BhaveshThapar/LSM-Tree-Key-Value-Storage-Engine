@@ -19,6 +19,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::fsutil::sync_dir;
 
 const CURRENT_FILENAME: &str = "CURRENT";
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
@@ -216,12 +217,6 @@ fn write_current(dir: &Path, gen: u64) -> Result<()> {
     }
     fs::rename(&tmp, dir.join(CURRENT_FILENAME))?;
     sync_dir(dir)?;
-    Ok(())
-}
-
-/// fsync a directory so a rename within it is durable.
-fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
     Ok(())
 }
 

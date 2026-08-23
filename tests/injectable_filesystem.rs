@@ -302,11 +302,17 @@ fn the_engine_runs_on_a_filesystem_that_is_neither_send_nor_sync() {
 /// unrelated buffer size changes is a test nobody trusts.
 struct RefusingFs {
     refuse: &'static str,
+    /// Appends to let through before refusing. Opening a database writes a file
+    /// header before it writes anything else, and a filesystem that refuses
+    /// that refuses the open — which is correct, and not what these tests are
+    /// aimed at.
+    allow_first: usize,
 }
 
 struct MaybeFailingFile {
     inner: <StdFs as Fs>::File,
     refuse_writes: bool,
+    allowance: usize,
 }
 
 impl File for MaybeFailingFile {
@@ -315,7 +321,10 @@ impl File for MaybeFailingFile {
     }
     fn append(&mut self, buf: &[u8]) -> io::Result<()> {
         if self.refuse_writes {
-            return Err(io::Error::new(io::ErrorKind::StorageFull, "no space left"));
+            if self.allowance == 0 {
+                return Err(io::Error::new(io::ErrorKind::StorageFull, "no space left"));
+            }
+            self.allowance -= 1;
         }
         self.inner.append(buf)
     }
@@ -344,6 +353,7 @@ impl Fs for RefusingFs {
         Ok(MaybeFailingFile {
             inner: StdFs.open(path, mode)?,
             refuse_writes,
+            allowance: self.allow_first,
         })
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -367,7 +377,15 @@ impl Fs for RefusingFs {
 #[test]
 fn an_injected_flush_failure_poisons_the_handle() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_manual(RefusingFs { refuse: ".db.tmp" }, dir.path(), manual_opts()).unwrap();
+    let db = Db::open_manual(
+        RefusingFs {
+            refuse: ".db.tmp",
+            allow_first: 0,
+        },
+        dir.path(),
+        manual_opts(),
+    )
+    .unwrap();
 
     for i in 0..200u32 {
         db.put(
@@ -403,7 +421,17 @@ fn an_injected_flush_failure_poisons_the_handle() {
 #[test]
 fn a_refused_wal_append_fails_the_write_without_poisoning_the_handle() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Db::open_manual(RefusingFs { refuse: "wal.log" }, dir.path(), manual_opts()).unwrap();
+    // One append through: the WAL's file header, which the open writes before
+    // any record and without which there is no database to test.
+    let db = Db::open_manual(
+        RefusingFs {
+            refuse: "wal.log",
+            allow_first: 1,
+        },
+        dir.path(),
+        manual_opts(),
+    )
+    .unwrap();
 
     db.put(b"k", b"v")
         .expect_err("the WAL refused the append and the write reported success");
@@ -424,4 +452,64 @@ fn a_refused_wal_append_fails_the_write_without_poisoning_the_handle() {
 fn mem_fs_is_not_send() {
     fn assert_not_required<F: Fs>(_: F) {}
     assert_not_required(MemFs::default());
+}
+
+// ------------------------------------------------------ the reclamation hazard
+
+/// What the file header exists to prevent, end to end.
+///
+/// The reclamation loop on open deletes every SSTable the manifest does not
+/// name. A manifest that cannot be read is therefore not a failed open — it is
+/// a *successful* one that takes the database with it. The engine now refuses
+/// instead, and the assertion that matters is not the error: it is that the
+/// SSTables are still on disk afterwards.
+#[test]
+fn an_unreadable_manifest_refuses_the_open_instead_of_deleting_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Db::open_with(dir.path(), manual_opts()).unwrap();
+        for i in 0..400u32 {
+            db.put(
+                format!("k{i:04}").as_bytes(),
+                b"a value long enough to matter",
+            )
+            .unwrap();
+        }
+        db.flush().unwrap();
+        assert!(db.sstable_count() > 0, "nothing was flushed to test with");
+    }
+
+    let tables_before: Vec<PathBuf> = StdFs
+        .list(dir.path())
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.to_string_lossy().ends_with(".db"))
+        .collect();
+    assert!(!tables_before.is_empty());
+
+    // Make the live manifest unreadable, the way a foreign file or a format
+    // this build does not understand would be.
+    let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let manifest = dir.path().join(current.trim());
+    std::fs::write(&manifest, b"not a manifest, not even close").unwrap();
+
+    let message = match Db::open_with(dir.path(), manual_opts()) {
+        Ok(_) => panic!("an unreadable manifest opened successfully"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        message.contains("readable frame"),
+        "the refusal did not say why: {message}"
+    );
+
+    let tables_after: Vec<PathBuf> = StdFs
+        .list(dir.path())
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.to_string_lossy().ends_with(".db"))
+        .collect();
+    assert_eq!(
+        tables_after, tables_before,
+        "the refused open deleted SSTables on its way out"
+    );
 }

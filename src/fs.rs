@@ -117,6 +117,10 @@ pub struct BufAppend<F: File> {
     file: F,
     buf: Vec<u8>,
     cap: usize,
+    /// Set when a flush failed. Bytes left buffered after that are bytes the
+    /// filesystem refused, not bytes somebody forgot about, and the check in
+    /// `Drop` has to be able to tell those apart.
+    write_failed: bool,
 }
 
 /// Sixty-four kilobytes: large enough that a record-at-a-time writer makes one
@@ -134,6 +138,7 @@ impl<F: File> BufAppend<F> {
             file,
             buf: Vec::with_capacity(cap),
             cap: cap.max(1),
+            write_failed: false,
         }
     }
 
@@ -149,7 +154,10 @@ impl<F: File> BufAppend<F> {
     /// see [`BufAppend::sync`].
     pub fn flush(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
-            self.file.append(&self.buf)?;
+            if let Err(e) = self.file.append(&self.buf) {
+                self.write_failed = true;
+                return Err(e);
+            }
             self.buf.clear();
         }
         Ok(())
@@ -158,21 +166,36 @@ impl<F: File> BufAppend<F> {
     /// Flush, then make it durable.
     pub fn sync(&mut self) -> io::Result<()> {
         self.flush()?;
-        self.file.sync()
-    }
-
-    pub fn get_ref(&self) -> &F {
-        &self.file
+        match self.file.sync() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.write_failed = true;
+                Err(e)
+            }
+        }
     }
 
     pub fn get_mut(&mut self) -> &mut F {
         &mut self.file
     }
+}
 
-    /// Flush and hand the file back.
-    pub fn into_inner(mut self) -> io::Result<F> {
-        self.flush()?;
-        Ok(self.file)
+/// Dropping with bytes still buffered loses them silently, which is the one
+/// failure mode a buffer in front of a durability path must not have. There is
+/// nowhere to report an error from a destructor, so this does not try to write
+/// them — it says so in a debug build and lets a release build lose them, which
+/// is what `BufWriter` does and is at least not worse.
+///
+/// Bytes left behind by a *failed* flush are a different thing: the filesystem
+/// refused them, nobody forgot them, and there was never anywhere for them to
+/// go. Those are not reported.
+impl<F: File> Drop for BufAppend<F> {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.buf.is_empty() || self.write_failed,
+            "{} buffered bytes were dropped without a flush",
+            self.buf.len()
+        );
     }
 }
 

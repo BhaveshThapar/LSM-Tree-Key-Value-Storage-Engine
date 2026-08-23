@@ -22,7 +22,7 @@ use crate::compactor::{self, CompactMsg};
 use crate::error::Result;
 use crate::fsutil::{self, DirLock};
 use crate::manifest::{Manifest, ManifestState, VersionEdit};
-use crate::memtable::{MemTable, DEFAULT_THRESHOLD};
+use crate::memtable::{DEFAULT_THRESHOLD, MemTable};
 use crate::record::Record;
 use crate::sstable::{SsTableReader, SsTableWriter};
 use crate::wal::Wal;
@@ -43,6 +43,32 @@ pub struct Options {
     pub compaction_threshold: usize,
     /// If false, SSTable reads skip the Bloom-filter pre-check (benchmarks only).
     pub bloom_enabled: bool,
+    /// Who runs flushes and compactions. See [`Maintenance`].
+    pub maintenance: Maintenance,
+}
+
+/// Who runs the engine's background work.
+///
+/// The default spawns two threads and is what an application wants: a writer
+/// never stalls behind a flush, and a long merge never blocks one.
+///
+/// [`Maintenance::Manual`] spawns nothing and hands the work to the caller,
+/// which is what a deterministic harness needs. A simulator that replays a run
+/// from a seed cannot have a thread deciding when a flush happens: the whole
+/// claim is that the run is a function of the seed, and a thread makes it a
+/// function of the scheduler too. The same is true of any caller that wants to
+/// know exactly when its data reached an SSTable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Maintenance {
+    /// A flush thread and a compaction thread, started by `open` and joined on
+    /// drop.
+    #[default]
+    Threads,
+    /// No threads. The caller drives the work with [`Db::maintain`], and
+    /// nothing happens if it does not — including the automatic flush that
+    /// bounds the MemTable, so a caller that never maintains will grow one
+    /// without limit.
+    Manual,
 }
 
 impl Default for Options {
@@ -52,6 +78,7 @@ impl Default for Options {
             sync_wal: true,
             compaction_threshold: 4,
             bloom_enabled: true,
+            maintenance: Maintenance::default(),
         }
     }
 }
@@ -70,6 +97,10 @@ enum Task {
 
 /// Owns the background flush and compaction threads, shutting both down and
 /// joining them on drop.
+///
+/// Absent entirely under [`Maintenance::Manual`], which is the point: not a
+/// thread that is idle, but no thread at all, so a caller can prove by
+/// inspection that nothing runs behind its back.
 struct Workers {
     flush_tx: Sender<Task>,
     compact_tx: Sender<CompactMsg>,
@@ -133,7 +164,7 @@ pub struct Db {
     // threads before `inner` (and its `Arc` refcount) goes away. It is only
     // ever used for that drop-time shutdown.
     #[allow(dead_code)]
-    workers: Workers,
+    workers: Option<Workers>,
     inner: Arc<DbInner>,
 }
 
@@ -229,21 +260,27 @@ impl Db {
             failed: RwLock::new(None),
         });
 
-        let flush_weak = Arc::downgrade(&inner);
-        let flush_handle = thread::spawn(move || worker_loop(flush_rx, flush_weak));
-        let compact_weak = Arc::downgrade(&inner);
-        let compact_handle =
-            thread::spawn(move || compactor::compaction_loop(compact_rx, compact_weak));
+        let workers = match inner.opts.maintenance {
+            Maintenance::Threads => {
+                let flush_weak = Arc::downgrade(&inner);
+                let flush_handle = thread::spawn(move || worker_loop(flush_rx, flush_weak));
+                let compact_weak = Arc::downgrade(&inner);
+                let compact_handle =
+                    thread::spawn(move || compactor::compaction_loop(compact_rx, compact_weak));
+                Some(Workers {
+                    flush_tx,
+                    compact_tx,
+                    flush_handle: Some(flush_handle),
+                    compact_handle: Some(compact_handle),
+                })
+            }
+            // The receivers are dropped here along with `flush_rx` and
+            // `compact_rx`, so every later `send` fails — which is already the
+            // ignored-error path the triggers take.
+            Maintenance::Manual => None,
+        };
 
-        Ok(Db {
-            workers: Workers {
-                flush_tx,
-                compact_tx,
-                flush_handle: Some(flush_handle),
-                compact_handle: Some(compact_handle),
-            },
-            inner,
-        })
+        Ok(Db { workers, inner })
     }
 
     /// First open of a directory: synthesize a manifest from whatever SSTables
@@ -290,10 +327,61 @@ impl Db {
     /// Flush the MemTable to a new SSTable and start a fresh WAL, then run any
     /// pending compaction — all synchronously. A no-op if the MemTable is
     /// empty.
+    ///
+    /// See [`Db::flush_only`] for the half of this that does not merge.
     pub fn flush(&self) -> Result<()> {
         self.inner.flush_inner()?;
         while self.inner.compact_step()? {}
         Ok(())
+    }
+
+    /// Flush the MemTable to a new SSTable, and stop there.
+    ///
+    /// [`Db::flush`] also drains every pending compaction, which is a merge of
+    /// unbounded size: a caller who wanted their writes on disk cannot tell how
+    /// long it will take, because the answer depends on how many SSTables have
+    /// accumulated. This is the bounded half — the work is proportional to the
+    /// MemTable, which the caller chose the size of.
+    ///
+    /// A caller that wants both, and wants to know the cost of each, calls this
+    /// and then [`Db::maintain`] in a loop.
+    pub fn flush_only(&self) -> Result<()> {
+        self.inner.flush_inner()
+    }
+
+    /// Do one unit of the work a background thread would otherwise have done,
+    /// and report whether any remains.
+    ///
+    /// A flush first when one is due, then one compaction step. One unit rather
+    /// than all of it, so a caller with something else to do — a consensus
+    /// host with a timer to service — can interleave rather than disappear into
+    /// a merge.
+    ///
+    /// Useful under either [`Maintenance`] setting, and required under
+    /// [`Maintenance::Manual`]: nothing else will flush, including the automatic
+    /// flush that bounds the MemTable.
+    ///
+    /// ```no_run
+    /// # use lsm_kv::{Db, Maintenance, Options};
+    /// # let opts = Options { maintenance: Maintenance::Manual, ..Options::default() };
+    /// # let db = Db::open_with("./data", opts)?;
+    /// while db.maintain()? {}
+    /// # Ok::<(), lsm_kv::Error>(())
+    /// ```
+    pub fn maintain(&self) -> Result<bool> {
+        if self.inner.flush_is_due() {
+            self.inner.flush_inner()?;
+            return Ok(true);
+        }
+        self.inner.compact_step()
+    }
+
+    /// Whether [`Db::maintain`] would do anything.
+    ///
+    /// Cheap enough to poll every turn of a host loop: it reads two lock-guarded
+    /// booleans and a length, and does no I/O.
+    pub fn pending_work(&self) -> bool {
+        self.inner.flush_is_due() || self.inner.compaction_is_due()
     }
 
     /// `Err` once a flush or a compaction has failed.
@@ -417,10 +505,10 @@ impl DbInner {
             return Ok(record.value.clone());
         }
         let frozen = self.frozen.read().clone();
-        if let Some(frozen) = frozen {
-            if let Some(record) = frozen.get_at(key, seq_bound) {
-                return Ok(record.value.clone());
-            }
+        if let Some(frozen) = frozen
+            && let Some(record) = frozen.get_at(key, seq_bound)
+        {
+            return Ok(record.value.clone());
         }
         let sstables = self.sstables.read().clone();
         for table in sstables.iter().rev() {
@@ -440,6 +528,29 @@ impl DbInner {
             .next()
             .copied()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Whether there is anything for a flush to do.
+    ///
+    /// A frozen MemTable means a previous flush froze and then failed to
+    /// publish; a full active one means the threshold has been crossed and
+    /// nothing has acted on it yet. Either way the next flush has work.
+    fn flush_is_due(&self) -> bool {
+        if self.frozen.read().is_some() {
+            return true;
+        }
+        let active = self.active.read();
+        !active.is_empty() && active.is_full()
+    }
+
+    /// Whether a compaction step would find a run to merge.
+    ///
+    /// Deliberately approximate: it compares the table count against the
+    /// threshold without reading a single file size, because the exact answer
+    /// costs a `stat` per table and this is polled on a hot loop. A false
+    /// positive costs one `compact_step` that returns `false`.
+    fn compaction_is_due(&self) -> bool {
+        self.sstables.read().len() >= self.opts.compaction_threshold
     }
 
     /// Freeze the active MemTable, write it to a new SSTable, publish it, and
@@ -1138,6 +1249,117 @@ mod tests {
         let db = Db::open(dir.path()).unwrap();
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
         assert!(crate::fsutil::lock_path(dir.path()).exists());
+    }
+
+    /// Manual maintenance spawns nothing. The evidence is that the work does
+    /// not happen on its own: writes past the threshold leave the MemTable
+    /// full and no SSTable behind them.
+    #[test]
+    fn manual_maintenance_runs_nothing_until_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            memtable_threshold: 128,
+            maintenance: Maintenance::Manual,
+            ..fast_opts()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+
+        for i in 0..64u32 {
+            db.put(format!("k{i:04}").as_bytes(), b"some value bytes")
+                .unwrap();
+        }
+        // A threads-mode handle would have flushed by now, on its own schedule.
+        // Give one every chance to prove it did.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            db.sstable_count(),
+            0,
+            "something flushed without being asked to"
+        );
+        assert!(
+            db.pending_work(),
+            "a full MemTable is work waiting to happen"
+        );
+
+        while db.maintain().unwrap() {}
+        assert!(db.sstable_count() > 0, "maintain did not flush");
+        assert!(!db.pending_work());
+
+        // And the data is all still there.
+        for i in 0..64u32 {
+            assert_eq!(
+                db.get(format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(&b"some value bytes"[..])
+            );
+        }
+    }
+
+    /// Under manual maintenance the engine is a function of its calls. Two
+    /// databases given the same writes and the same maintenance calls end with
+    /// the same number of SSTables — which is the property a deterministic
+    /// harness needs and a thread cannot provide.
+    #[test]
+    fn manual_maintenance_is_reproducible() {
+        let run = || {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = Options {
+                memtable_threshold: 256,
+                compaction_threshold: 2,
+                maintenance: Maintenance::Manual,
+                ..fast_opts()
+            };
+            let db = Db::open_with(dir.path(), opts).unwrap();
+            let mut counts = Vec::new();
+            for i in 0..200u32 {
+                db.put(format!("k{i:04}").as_bytes(), b"value").unwrap();
+                if i % 10 == 0 {
+                    let _ = db.maintain().unwrap();
+                    counts.push(db.sstable_count());
+                }
+            }
+            counts
+        };
+        assert_eq!(run(), run(), "the same calls produced a different history");
+    }
+
+    /// `flush_only` is the bounded half of `flush`: it writes the MemTable out
+    /// and does not go on to merge.
+    #[test]
+    fn flush_only_does_not_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            memtable_threshold: 64,
+            compaction_threshold: 2,
+            maintenance: Maintenance::Manual,
+            ..fast_opts()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+
+        // Three separate flushes, so a compaction is well past due.
+        for round in 0..3u32 {
+            for i in 0..8u32 {
+                db.put(format!("k{round}{i}").as_bytes(), b"v").unwrap();
+            }
+            db.flush_only().unwrap();
+        }
+        assert_eq!(
+            db.sstable_count(),
+            3,
+            "flush_only merged tables it was not asked to merge"
+        );
+        assert!(db.pending_work(), "a merge is due and was not noticed");
+
+        db.flush().unwrap();
+        assert!(
+            db.sstable_count() < 3,
+            "flush did not drain the compaction flush_only left"
+        );
+    }
+
+    /// The default is unchanged: threads, started by open.
+    #[test]
+    fn threads_remain_the_default() {
+        assert_eq!(Options::default().maintenance, Maintenance::Threads);
     }
 
     #[test]

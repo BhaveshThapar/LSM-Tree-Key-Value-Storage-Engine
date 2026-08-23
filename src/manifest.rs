@@ -9,7 +9,7 @@
 //! `payload` is `[edit_tag:1][body:8]` (all little-endian). A torn trailing
 //! frame is tolerated exactly like [`Wal::replay`](crate::wal).
 //!
-//! A `CURRENT` file holds the ASCII name of the live `MANIFEST-<gen>` file and
+//! A `CURRENT` file holds the ASCII name of the live `MANIFEST-<generation>` file and
 //! is swapped atomically via a rename, so the manifest set is always
 //! recoverable even across a crash mid-rollover.
 
@@ -102,7 +102,7 @@ impl ManifestState {
 /// An append-only manifest log open for writing.
 pub struct Manifest {
     dir: PathBuf,
-    gen: u64,
+    generation: u64,
     file: BufWriter<File>,
 }
 
@@ -115,12 +115,12 @@ impl Manifest {
     /// Open the existing manifest at `dir`, replay it, and roll it over into a
     /// fresh compacted generation. Returns the writer and the replayed state.
     pub fn open(dir: &Path) -> Result<(Manifest, ManifestState)> {
-        let gen = read_current(dir)?;
-        let state = replay(&manifest_path(dir, gen))?;
+        let generation = read_current(dir)?;
+        let state = replay(&manifest_path(dir, generation))?;
         let mut manifest = Manifest {
             dir: dir.to_path_buf(),
-            gen,
-            file: BufWriter::new(open_append(&manifest_path(dir, gen))?),
+            generation,
+            file: BufWriter::new(open_append(&manifest_path(dir, generation))?),
         };
         // Compact the log so it never grows across the lifetime of the dir.
         manifest.rollover(&state)?;
@@ -130,18 +130,18 @@ impl Manifest {
     /// Create a fresh, empty manifest at `dir` (generation 0) and point
     /// `CURRENT` at it. Used on first open and during Phase 2 migration.
     pub fn create(dir: &Path) -> Result<Manifest> {
-        let gen = 0;
-        let path = manifest_path(dir, gen);
+        let generation = 0;
+        let path = manifest_path(dir, generation);
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)?;
         file.sync_all()?;
-        write_current(dir, gen)?;
+        write_current(dir, generation)?;
         Ok(Manifest {
             dir: dir.to_path_buf(),
-            gen,
+            generation,
             file: BufWriter::new(file),
         })
     }
@@ -163,13 +163,13 @@ impl Manifest {
     /// Write `state` into a fresh manifest generation and atomically swap
     /// `CURRENT` to point at it, then delete the previous generation.
     pub fn rollover(&mut self, state: &ManifestState) -> Result<()> {
-        let old_gen = self.gen;
+        let old_gen = self.generation;
         let new_gen = old_gen + 1;
         let new_path = manifest_path(&self.dir, new_gen);
 
         let mut writer = Manifest {
             dir: self.dir.clone(),
-            gen: new_gen,
+            generation: new_gen,
             file: BufWriter::new(
                 OpenOptions::new()
                     .write(true)
@@ -183,15 +183,15 @@ impl Manifest {
         // Atomic publish: CURRENT now names the new, durable generation.
         write_current(&self.dir, new_gen)?;
 
-        self.gen = new_gen;
+        self.generation = new_gen;
         self.file = writer.file;
         let _ = fs::remove_file(manifest_path(&self.dir, old_gen));
         Ok(())
     }
 }
 
-fn manifest_path(dir: &Path, gen: u64) -> PathBuf {
-    dir.join(format!("MANIFEST-{gen:06}"))
+fn manifest_path(dir: &Path, generation: u64) -> PathBuf {
+    dir.join(format!("MANIFEST-{generation:06}"))
 }
 
 fn open_append(path: &Path) -> Result<File> {
@@ -207,12 +207,12 @@ fn read_current(dir: &Path) -> Result<u64> {
         .ok_or_else(|| Error::Corrupt(format!("bad CURRENT contents: {name:?}")))
 }
 
-/// Atomically point `CURRENT` at `MANIFEST-<gen>` via a rename.
-fn write_current(dir: &Path, gen: u64) -> Result<()> {
+/// Atomically point `CURRENT` at `MANIFEST-<generation>` via a rename.
+fn write_current(dir: &Path, generation: u64) -> Result<()> {
     let tmp = dir.join("CURRENT.tmp");
     {
         let mut f = File::create(&tmp)?;
-        writeln!(f, "MANIFEST-{gen:06}")?;
+        writeln!(f, "MANIFEST-{generation:06}")?;
         f.sync_all()?;
     }
     fs::rename(&tmp, dir.join(CURRENT_FILENAME))?;

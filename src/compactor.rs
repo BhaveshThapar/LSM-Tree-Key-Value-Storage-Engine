@@ -8,8 +8,8 @@
 //! It holds only a `Weak` reference to the engine state, so it never keeps the
 //! database alive on its own.
 
-use std::sync::mpsc::Receiver;
 use std::sync::Weak;
+use std::sync::mpsc::Receiver;
 
 use crate::db::DbInner;
 

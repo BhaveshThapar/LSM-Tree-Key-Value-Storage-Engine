@@ -4,38 +4,33 @@
 //! Frame layout: `[crc32:4][payload_len:4][payload]`, where `payload` is a
 //! [`Record`] encoding and the CRC is computed over `payload` only.
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::fs::{BufAppend, File, Fs, OpenMode};
 use crate::record::Record;
 
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
 
 /// An append-only write-ahead log bound to a single active MemTable.
-pub struct Wal {
-    file: BufWriter<File>,
+pub struct Wal<F: Fs> {
+    file: BufAppend<F::File>,
     path: PathBuf,
     sync: bool,
 }
 
-impl Wal {
+impl<F: Fs> Wal<F> {
     /// Create a *fresh* WAL at `path`, truncating any existing file.
     ///
     /// Only ever called on a scratch path. Pointing it at the live `wal.log`
     /// would truncate a file that is still the only durable home of every write
     /// acknowledged since the last freeze; the flush path builds the
     /// replacement beside it and renames it into place instead.
-    pub fn create(path: impl Into<PathBuf>, sync: bool) -> Result<Wal> {
+    pub fn create(fs: &F, path: impl Into<PathBuf>, sync: bool) -> Result<Wal<F>> {
         let path = path.into();
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let file = fs.open(&path, OpenMode::Truncate)?;
         Ok(Wal {
-            file: BufWriter::new(file),
+            file: BufAppend::new(file),
             path,
             sync,
         })
@@ -45,11 +40,11 @@ impl Wal {
     ///
     /// This is the correct choice on database open: the file still backs the
     /// records just replayed into the MemTable until the next flush.
-    pub fn open_append(path: impl Into<PathBuf>, sync: bool) -> Result<Wal> {
+    pub fn open_append(fs: &F, path: impl Into<PathBuf>, sync: bool) -> Result<Wal<F>> {
         let path = path.into();
-        let file = OpenOptions::new().append(true).create(true).open(&path)?;
+        let file = fs.open(&path, OpenMode::Append)?;
         Ok(Wal {
-            file: BufWriter::new(file),
+            file: BufAppend::new(file),
             path,
             sync,
         })
@@ -65,12 +60,15 @@ impl Wal {
     pub fn append(&mut self, record: &Record) -> Result<()> {
         let payload = record.encode();
         let crc = crc32fast::hash(&payload);
-        self.file.write_all(&crc.to_le_bytes())?;
-        self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        self.file.write_all(&payload)?;
+        self.file.write(&crc.to_le_bytes())?;
+        self.file.write(&(payload.len() as u32).to_le_bytes())?;
+        self.file.write(&payload)?;
+        // A record that is still in this process's buffer is a record a crash
+        // loses without the file ever being short, so the buffer is emptied on
+        // every append whether or not the sync follows.
         self.file.flush()?;
         if self.sync {
-            self.file.get_ref().sync_all()?;
+            self.file.get_mut().sync()?;
         }
         Ok(())
     }
@@ -81,8 +79,7 @@ impl Wal {
     /// about to publish this file by rename has to ask explicitly: the rename
     /// would otherwise make a file visible whose contents may not be on disk.
     pub fn sync(&mut self) -> Result<()> {
-        self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+        self.file.sync()?;
         Ok(())
     }
 
@@ -90,9 +87,9 @@ impl Wal {
     ///
     /// The open descriptor follows the inode, so appends after this land in the
     /// renamed file.
-    pub fn rename_to(&mut self, dest: impl AsRef<Path>) -> Result<()> {
+    pub fn rename_to(&mut self, fs: &F, dest: impl AsRef<Path>) -> Result<()> {
         let dest = dest.as_ref();
-        std::fs::rename(&self.path, dest)?;
+        fs.rename(&self.path, dest)?;
         self.path = dest.to_path_buf();
         Ok(())
     }
@@ -101,15 +98,12 @@ impl Wal {
     ///
     /// A torn trailing frame (a crash mid-append) is expected: replay stops
     /// cleanly at the first truncated or CRC-mismatched frame.
-    pub fn replay(path: impl AsRef<Path>) -> Result<Vec<Record>> {
-        let mut bytes = Vec::new();
-        match File::open(path.as_ref()) {
-            Ok(mut f) => {
-                f.read_to_end(&mut bytes)?;
-            }
+    pub fn replay(fs: &F, path: impl AsRef<Path>) -> Result<Vec<Record>> {
+        let bytes = match fs.open(path.as_ref(), OpenMode::Read) {
+            Ok(f) => f.read_all()?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
-        }
+        };
 
         let mut records = Vec::new();
         let mut pos = 0;
@@ -140,7 +134,8 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Seek;
+    use crate::fs::StdFs;
+    use std::io::{Read, Seek, Write};
 
     fn tmp() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -151,13 +146,13 @@ mod tests {
     #[test]
     fn append_and_replay() {
         let (_d, path) = tmp();
-        let mut wal = Wal::create(&path, false).unwrap();
+        let mut wal = Wal::create(&StdFs, &path, false).unwrap();
         wal.append(&Record::put(b"a".to_vec(), b"1".to_vec(), 1))
             .unwrap();
         wal.append(&Record::tombstone(b"b".to_vec(), 2)).unwrap();
         drop(wal);
 
-        let records = Wal::replay(&path).unwrap();
+        let records = Wal::replay(&StdFs, &path).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].value, Some(b"1".to_vec()));
         assert!(records[1].value.is_none());
@@ -166,13 +161,13 @@ mod tests {
     #[test]
     fn replay_missing_file_is_empty() {
         let (_d, path) = tmp();
-        assert!(Wal::replay(&path).unwrap().is_empty());
+        assert!(Wal::replay(&StdFs, &path).unwrap().is_empty());
     }
 
     #[test]
     fn torn_trailing_frame_is_ignored() {
         let (_d, path) = tmp();
-        let mut wal = Wal::create(&path, false).unwrap();
+        let mut wal = Wal::create(&StdFs, &path, false).unwrap();
         wal.append(&Record::put(b"good".to_vec(), b"v".to_vec(), 1))
             .unwrap();
         wal.append(&Record::put(b"torn".to_vec(), b"vvvv".to_vec(), 2))
@@ -180,12 +175,12 @@ mod tests {
         drop(wal);
 
         // Simulate a crash mid-append: chop off the last 3 bytes.
-        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len - 3).unwrap();
         f.sync_all().unwrap();
 
-        let records = Wal::replay(&path).unwrap();
+        let records = Wal::replay(&StdFs, &path).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, b"good");
     }
@@ -193,13 +188,13 @@ mod tests {
     #[test]
     fn crc_mismatch_stops_replay() {
         let (_d, path) = tmp();
-        let mut wal = Wal::create(&path, false).unwrap();
+        let mut wal = Wal::create(&StdFs, &path, false).unwrap();
         wal.append(&Record::put(b"k".to_vec(), b"v".to_vec(), 1))
             .unwrap();
         drop(wal);
 
         // Flip a byte inside the payload.
-        let mut f = OpenOptions::new()
+        let mut f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
@@ -211,6 +206,6 @@ mod tests {
         f.write_all(&[last[0] ^ 0xFF]).unwrap();
         drop(f);
 
-        assert!(Wal::replay(&path).unwrap().is_empty());
+        assert!(Wal::replay(&StdFs, &path).unwrap().is_empty());
     }
 }

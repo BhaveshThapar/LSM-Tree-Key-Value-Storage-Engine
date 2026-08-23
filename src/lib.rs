@@ -19,6 +19,7 @@ mod compaction;
 mod compactor;
 mod db;
 mod error;
+pub mod fs;
 mod fsutil;
 mod manifest;
 mod memtable;
@@ -27,6 +28,7 @@ mod sstable;
 mod wal;
 
 pub use db::{Db, Maintenance, Options, Snapshot};
+pub use fs::{BufAppend, File, Fs, OpenMode, StdFile, StdFs};
 
 /// Internal decoders exposed for fuzzing only (`--features fuzzing`).
 ///

@@ -11,6 +11,7 @@ use std::collections::BinaryHeap;
 use std::path::Path;
 
 use crate::error::Result;
+use crate::fs::Fs;
 use crate::record::Record;
 use crate::sstable::{SsTableReader, SsTableWriter};
 
@@ -55,9 +56,10 @@ impl PartialOrd for MergeItem {
 /// preserved for snapshot reads; below it only the newest version per key is
 /// kept. Output is sorted key-ascending, and seq-descending within a key.
 /// Returns the number of records written.
-pub fn compact(
+pub fn compact<F: Fs>(
+    fs: &F,
     out_path: &Path,
-    inputs: &[&SsTableReader],
+    inputs: &[&SsTableReader<F>],
     drop_tombstones: bool,
     min_snapshot_seq: u64,
 ) -> Result<u64> {
@@ -124,17 +126,18 @@ pub fn compact(
         i = j;
     }
 
-    SsTableWriter::write(out_path, &out)
+    SsTableWriter::write(fs, out_path, &out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::StdFs;
 
-    fn table(dir: &Path, name: &str, records: &[Record]) -> SsTableReader {
+    fn table(dir: &Path, name: &str, records: &[Record]) -> SsTableReader<StdFs> {
         let path = dir.join(name);
-        SsTableWriter::write(&path, records).unwrap();
-        SsTableReader::open(&path, true).unwrap()
+        SsTableWriter::write(&StdFs, &path, records).unwrap();
+        SsTableReader::open(&StdFs, &path, true).unwrap()
     }
 
     #[test]
@@ -151,8 +154,8 @@ mod tests {
             &[Record::put(b"k".to_vec(), b"new".to_vec(), 2)],
         );
         let out = dir.path().join("out.db");
-        compact(&out, &[&old, &new], false, u64::MAX).unwrap();
-        let r = SsTableReader::open(&out, true).unwrap();
+        compact(&StdFs, &out, &[&old, &new], false, u64::MAX).unwrap();
+        let r = SsTableReader::open(&StdFs, &out, true).unwrap();
         assert_eq!(r.get(b"k").unwrap().unwrap().value, Some(b"new".to_vec()));
     }
 
@@ -166,9 +169,9 @@ mod tests {
         );
         let new = table(dir.path(), "b.db", &[Record::tombstone(b"k".to_vec(), 2)]);
         let out = dir.path().join("out.db");
-        let n = compact(&out, &[&old, &new], true, u64::MAX).unwrap();
+        let n = compact(&StdFs, &out, &[&old, &new], true, u64::MAX).unwrap();
         assert_eq!(n, 0);
-        let r = SsTableReader::open(&out, true).unwrap();
+        let r = SsTableReader::open(&StdFs, &out, true).unwrap();
         assert!(r.get(b"k").unwrap().is_none());
     }
 
@@ -182,9 +185,9 @@ mod tests {
         );
         let new = table(dir.path(), "b.db", &[Record::tombstone(b"k".to_vec(), 2)]);
         let out = dir.path().join("out.db");
-        let n = compact(&out, &[&old, &new], false, u64::MAX).unwrap();
+        let n = compact(&StdFs, &out, &[&old, &new], false, u64::MAX).unwrap();
         assert_eq!(n, 1);
-        let r = SsTableReader::open(&out, true).unwrap();
+        let r = SsTableReader::open(&StdFs, &out, true).unwrap();
         assert!(r.get(b"k").unwrap().unwrap().value.is_none());
     }
 
@@ -204,8 +207,8 @@ mod tests {
         let out = dir.path().join("out.db");
         // A snapshot horizon of 3 keeps v2 (seq 5 >= 3) and the newest version
         // below the horizon (v1, seq 1).
-        compact(&out, &[&old, &new], true, 3).unwrap();
-        let r = SsTableReader::open(&out, true).unwrap();
+        compact(&StdFs, &out, &[&old, &new], true, 3).unwrap();
+        let r = SsTableReader::open(&StdFs, &out, true).unwrap();
         assert_eq!(r.record_count(), 2);
         assert_eq!(r.get(b"k").unwrap().unwrap().value, Some(b"v2".to_vec()));
         // The snapshot at horizon 3 still sees v1.
@@ -229,8 +232,8 @@ mod tests {
             &[Record::put(b"k".to_vec(), b"v2".to_vec(), 5)],
         );
         let out = dir.path().join("out.db");
-        compact(&out, &[&old, &new], true, u64::MAX).unwrap();
-        let r = SsTableReader::open(&out, true).unwrap();
+        compact(&StdFs, &out, &[&old, &new], true, u64::MAX).unwrap();
+        let r = SsTableReader::open(&StdFs, &out, true).unwrap();
         assert_eq!(r.record_count(), 1);
         assert_eq!(r.get(b"k").unwrap().unwrap().value, Some(b"v2".to_vec()));
     }
@@ -252,8 +255,8 @@ mod tests {
             &[Record::put(b"b".to_vec(), b"2".to_vec(), 3)],
         );
         let out = dir.path().join("out.db");
-        compact(&out, &[&a, &b], false, u64::MAX).unwrap();
-        let r = SsTableReader::open(&out, true).unwrap();
+        compact(&StdFs, &out, &[&a, &b], false, u64::MAX).unwrap();
+        let r = SsTableReader::open(&StdFs, &out, true).unwrap();
         assert_eq!(r.record_count(), 3);
         for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
             assert_eq!(r.get(k).unwrap().unwrap().value, Some(v.to_vec()));

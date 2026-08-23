@@ -7,7 +7,6 @@
 //! background worker thread, so writers never stall waiting on flush I/O.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::compaction;
 use crate::compactor::{self, CompactMsg};
 use crate::error::Result;
+use crate::fs::{Fs, StdFs};
 use crate::fsutil::{self, DirLock};
 use crate::manifest::{Manifest, ManifestState, VersionEdit};
 use crate::memtable::{DEFAULT_THRESHOLD, MemTable};
@@ -84,9 +84,9 @@ impl Default for Options {
 }
 
 /// An immutable SSTable on disk, tagged with its id (higher id == newer).
-struct SsTable {
+struct SsTable<F: Fs> {
     id: u64,
-    reader: SsTableReader,
+    reader: SsTableReader<F>,
 }
 
 /// A unit of background work for the flush worker thread.
@@ -123,24 +123,26 @@ impl Drop for Workers {
 
 /// The shared, lock-protected engine state. Reachable from both the public
 /// [`Db`] handle and (via a `Weak`) the background threads.
-pub(crate) struct DbInner {
+pub(crate) struct DbInner<F: Fs> {
     dir: PathBuf,
     opts: Options,
+    /// The filesystem every path below goes through.
+    fs: F,
     /// Held for the lifetime of the handle; released when it is dropped.
-    _lock: DirLock,
+    _lock: DirLock<F>,
     /// Serializes WAL appends; also held across the matching MemTable insert
     /// so a record is never visible in one without the other.
-    wal: Mutex<Wal>,
+    wal: Mutex<Wal<F>>,
     /// The MemTable accepting writes.
     active: RwLock<MemTable>,
     /// A MemTable frozen for flushing; reads still consult it until the flush
     /// publishes its SSTable.
     frozen: RwLock<Option<Arc<MemTable>>>,
     /// Live SSTables, oldest -> newest by position; swapped wholesale on change.
-    sstables: RwLock<Arc<Vec<Arc<SsTable>>>>,
+    sstables: RwLock<Arc<Vec<Arc<SsTable<F>>>>>,
     next_sst_id: AtomicU64,
     next_seq: AtomicU64,
-    manifest: Mutex<Manifest>,
+    manifest: Mutex<Manifest<F>>,
     /// Held for the duration of a flush; the publish step of a compaction
     /// takes it too, so the two never mutate `sstables` concurrently.
     flush_lock: Mutex<()>,
@@ -159,107 +161,40 @@ pub(crate) struct DbInner {
 }
 
 /// An embedded LSM-tree key/value store.
-pub struct Db {
+pub struct Db<F: Fs = StdFs> {
     // Field order matters: `workers` is dropped first, joining the background
     // threads before `inner` (and its `Arc` refcount) goes away. It is only
     // ever used for that drop-time shutdown.
     #[allow(dead_code)]
     workers: Option<Workers>,
-    inner: Arc<DbInner>,
+    inner: Arc<DbInner<F>>,
 }
 
-impl Db {
+impl Db<StdFs> {
     /// Open (creating if needed) the database rooted at `dir` with defaults.
-    pub fn open(dir: impl AsRef<Path>) -> Result<Db> {
+    pub fn open(dir: impl AsRef<Path>) -> Result<Db<StdFs>> {
         Db::open_with(dir, Options::default())
     }
 
     /// Open the database rooted at `dir` with explicit [`Options`].
-    pub fn open_with(dir: impl AsRef<Path>, opts: Options) -> Result<Db> {
-        let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+    pub fn open_with(dir: impl AsRef<Path>, opts: Options) -> Result<Db<StdFs>> {
+        Db::open_on(StdFs, dir, opts)
+    }
+}
 
-        // Before anything else. Everything below this line either mutates the
-        // directory or deletes from it — the manifest rolls its generation
-        // forward and unlinks the old one, and the reclamation loop removes
-        // every SSTable the manifest does not name. A second handle running the
-        // same sequence concurrently would delete this one's files, and this
-        // one would delete its files back.
-        let lock = DirLock::acquire(&dir)?;
-
-        // The manifest is the authoritative record of the live SSTable set and
-        // the global counters. If absent, migrate a Phase 2 directory by
-        // scanning its `sst_*.db` files into a fresh manifest.
-        let (manifest, state) = if Manifest::exists(&dir) {
-            Manifest::open(&dir)?
-        } else {
-            Db::migrate_dir(&dir)?
-        };
-
-        // Reclaim orphan SSTables: any `sst_*.db` not named by the manifest is
-        // a leftover from a crash before its `AddTable` edit was durable.
-        let lock_name = fsutil::lock_path(&dir);
-        for entry in fs::read_dir(&dir)? {
-            let name = entry?.file_name();
-            let name = name.to_string_lossy();
-            if dir.join(name.as_ref()) == lock_name {
-                continue;
-            }
-            if let Some(id) = parse_sst_id(&name) {
-                if !state.live_tables.contains(&id) {
-                    fs::remove_file(dir.join(name.as_ref()))?;
-                }
-            } else if name.ends_with(".db.tmp") || name == WAL_TMP_FILENAME {
-                fs::remove_file(dir.join(name.as_ref()))?;
-            }
-        }
-
-        // Open the live SSTables, ordered oldest -> newest by id.
-        let sstables: Vec<Arc<SsTable>> = state
-            .live_tables
-            .iter()
-            .map(|&id| {
-                SsTableReader::open(sst_path(&dir, id), opts.bloom_enabled)
-                    .map(|reader| Arc::new(SsTable { id, reader }))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Replay the WAL into a fresh MemTable. The manifest persists `next_seq`
-        // across clean flushes; the live WAL may carry seqs beyond it.
-        let wal_path = dir.join(WAL_FILENAME);
-        let replayed = Wal::replay(&wal_path)?;
-        let mut memtable = MemTable::new(opts.memtable_threshold);
-        let mut next_seq = state.next_seq;
-        for record in replayed {
-            next_seq = next_seq.max(record.seq + 1);
-            memtable.insert(record);
-        }
-        // Open the WAL for *appending*: it still backs the records just
-        // replayed into the MemTable until the next flush moves them to an
-        // SSTable. Truncating here would lose them if we exit before flushing.
-        let wal = Wal::open_append(&wal_path, opts.sync_wal)?;
-
-        let (flush_tx, flush_rx) = mpsc::channel();
-        let (compact_tx, compact_rx) = mpsc::channel();
-        let inner = Arc::new(DbInner {
-            dir,
-            opts,
-            _lock: lock,
-            wal: Mutex::new(wal),
-            active: RwLock::new(memtable),
-            frozen: RwLock::new(None),
-            sstables: RwLock::new(Arc::new(sstables)),
-            next_sst_id: AtomicU64::new(state.next_sst_id),
-            next_seq: AtomicU64::new(next_seq),
-            manifest: Mutex::new(manifest),
-            flush_lock: Mutex::new(()),
-            compaction_lock: Mutex::new(()),
-            snapshots: Mutex::new(BTreeMap::new()),
-            worker_tx: flush_tx.clone(),
-            compact_tx: compact_tx.clone(),
-            failed: RwLock::new(None),
-        });
-
+impl<F: Fs + Send + Sync> Db<F>
+where
+    F::File: Send + Sync,
+{
+    /// Open on `fs`, honouring [`Options::maintenance`].
+    ///
+    /// The `Send + Sync` bounds are here rather than on [`Fs`] because they are
+    /// what spawning a thread needs, and only [`Maintenance::Threads`] spawns
+    /// one. A single-threaded harness whose filesystem is built on
+    /// `Rc<RefCell<_>>` cannot satisfy them and should not have to: see
+    /// [`Db::open_manual`].
+    pub fn open_on(fs: F, dir: impl AsRef<Path>, opts: Options) -> Result<Db<F>> {
+        let (inner, flush_tx, flush_rx, compact_tx, compact_rx) = Db::assemble(fs, dir, opts)?;
         let workers = match inner.opts.maintenance {
             Maintenance::Threads => {
                 let flush_weak = Arc::downgrade(&inner);
@@ -279,24 +214,155 @@ impl Db {
             // ignored-error path the triggers take.
             Maintenance::Manual => None,
         };
-
         Ok(Db { workers, inner })
+    }
+}
+
+impl<F: Fs> Db<F> {
+    /// Open on `fs` with no background threads, whatever [`Options::maintenance`]
+    /// says.
+    ///
+    /// This is the constructor a deterministic harness uses. It asks nothing of
+    /// `F` beyond [`Fs`] — no `Send`, no `Sync` — because it starts no thread
+    /// that would need them, so a filesystem built on `Rc<RefCell<_>>` is
+    /// allowed here and atomics stay out of the one component that has to
+    /// reproduce a run exactly.
+    ///
+    /// The caller drives the work with [`Db::maintain`]; nothing happens if it
+    /// does not.
+    pub fn open_manual(fs: F, dir: impl AsRef<Path>, opts: Options) -> Result<Db<F>> {
+        let opts = Options {
+            maintenance: Maintenance::Manual,
+            ..opts
+        };
+        let (inner, _flush_tx, _flush_rx, _compact_tx, _compact_rx) = Db::assemble(fs, dir, opts)?;
+        Ok(Db {
+            workers: None,
+            inner,
+        })
+    }
+
+    /// Everything both constructors do: lock, recover, and build the state.
+    ///
+    /// Hands back the channel ends rather than keeping them, so the caller
+    /// decides whether anything is on the other side of them.
+    #[allow(clippy::type_complexity)]
+    fn assemble(
+        fs: F,
+        dir: impl AsRef<Path>,
+        opts: Options,
+    ) -> Result<(
+        Arc<DbInner<F>>,
+        Sender<Task>,
+        Receiver<Task>,
+        Sender<CompactMsg>,
+        Receiver<CompactMsg>,
+    )> {
+        let dir = dir.as_ref().to_path_buf();
+        fs.create_dir_all(&dir)?;
+
+        // Before anything else. Everything below this line either mutates the
+        // directory or deletes from it — the manifest rolls its generation
+        // forward and unlinks the old one, and the reclamation loop removes
+        // every SSTable the manifest does not name. A second handle running the
+        // same sequence concurrently would delete this one's files, and this
+        // one would delete its files back.
+        let lock = DirLock::acquire(&fs, &dir)?;
+
+        // The manifest is the authoritative record of the live SSTable set and
+        // the global counters. If absent, migrate a Phase 2 directory by
+        // scanning its `sst_*.db` files into a fresh manifest.
+        let (manifest, state) = if Manifest::exists(&fs, &dir) {
+            Manifest::open(&fs, &dir)?
+        } else {
+            Db::migrate_dir(&fs, &dir)?
+        };
+
+        // Reclaim orphan SSTables: any `sst_*.db` not named by the manifest is
+        // a leftover from a crash before its `AddTable` edit was durable.
+        let lock_name = fsutil::lock_path(&dir);
+        for path in fs.list(&dir)? {
+            if path == lock_name {
+                continue;
+            }
+            let name = match path.file_name() {
+                Some(name) => name.to_string_lossy().into_owned(),
+                None => continue,
+            };
+            if let Some(id) = parse_sst_id(&name) {
+                if !state.live_tables.contains(&id) {
+                    fs.remove(&path)?;
+                }
+            } else if name.ends_with(".db.tmp") || name == WAL_TMP_FILENAME {
+                fs.remove(&path)?;
+            }
+        }
+
+        // Open the live SSTables, ordered oldest -> newest by id.
+        let sstables: Vec<Arc<SsTable<F>>> = state
+            .live_tables
+            .iter()
+            .map(|&id| {
+                SsTableReader::open(&fs, sst_path(&dir, id), opts.bloom_enabled)
+                    .map(|reader| Arc::new(SsTable { id, reader }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Replay the WAL into a fresh MemTable. The manifest persists `next_seq`
+        // across clean flushes; the live WAL may carry seqs beyond it.
+        let wal_path = dir.join(WAL_FILENAME);
+        let replayed = Wal::replay(&fs, &wal_path)?;
+        let mut memtable = MemTable::new(opts.memtable_threshold);
+        let mut next_seq = state.next_seq;
+        for record in replayed {
+            next_seq = next_seq.max(record.seq + 1);
+            memtable.insert(record);
+        }
+        // Open the WAL for *appending*: it still backs the records just
+        // replayed into the MemTable until the next flush moves them to an
+        // SSTable. Truncating here would lose them if we exit before flushing.
+        let wal = Wal::open_append(&fs, &wal_path, opts.sync_wal)?;
+
+        let (flush_tx, flush_rx) = mpsc::channel();
+        let (compact_tx, compact_rx) = mpsc::channel();
+        let inner = Arc::new(DbInner {
+            dir,
+            opts,
+            fs,
+            _lock: lock,
+            wal: Mutex::new(wal),
+            active: RwLock::new(memtable),
+            frozen: RwLock::new(None),
+            sstables: RwLock::new(Arc::new(sstables)),
+            next_sst_id: AtomicU64::new(state.next_sst_id),
+            next_seq: AtomicU64::new(next_seq),
+            manifest: Mutex::new(manifest),
+            flush_lock: Mutex::new(()),
+            compaction_lock: Mutex::new(()),
+            snapshots: Mutex::new(BTreeMap::new()),
+            worker_tx: flush_tx.clone(),
+            compact_tx: compact_tx.clone(),
+            failed: RwLock::new(None),
+        });
+
+        Ok((inner, flush_tx, flush_rx, compact_tx, compact_rx))
     }
 
     /// First open of a directory: synthesize a manifest from whatever SSTables
     /// already exist (a Phase 2 layout, or an empty directory).
-    fn migrate_dir(dir: &Path) -> Result<(Manifest, ManifestState)> {
+    fn migrate_dir(fs: &F, dir: &Path) -> Result<(Manifest<F>, ManifestState)> {
         let mut sst_ids = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let name = entry?.file_name();
-            if let Some(id) = parse_sst_id(&name.to_string_lossy()) {
+        for path in fs.list(dir)? {
+            if let Some(name) = path.file_name()
+                && let Some(id) = parse_sst_id(&name.to_string_lossy())
+            {
                 sst_ids.push(id);
             }
         }
         sst_ids.sort_unstable();
         let next_sst_id = sst_ids.last().map_or(0, |&id| id + 1);
 
-        let mut manifest = Manifest::create(dir)?;
+        let mut manifest = Manifest::create(fs, dir)?;
         let mut edits = vec![VersionEdit::SetNextSstId(next_sst_id)];
         edits.extend(sst_ids.iter().map(|&id| VersionEdit::AddTable { id }));
         manifest.append_batch(&edits)?;
@@ -405,7 +471,7 @@ impl Db {
     ///
     /// While a snapshot is alive, compaction preserves the record versions it
     /// can see, so a long-lived snapshot pins disk space.
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> Snapshot<F> {
         let horizon = self.inner.next_seq.load(Ordering::SeqCst);
         *self.inner.snapshots.lock().entry(horizon).or_insert(0) += 1;
         Snapshot {
@@ -416,20 +482,20 @@ impl Db {
 
     /// Read `key` as of `snapshot` — the value it had when the snapshot was
     /// taken, ignoring every later write.
-    pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get_at(&self, snapshot: &Snapshot<F>, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.inner.get_at(key, snapshot.horizon)
     }
 }
 
 /// A point-in-time view of the database. Reads through a snapshot (via
 /// [`Db::get_at`]) see only writes that preceded [`Db::snapshot`].
-pub struct Snapshot {
+pub struct Snapshot<F: Fs = StdFs> {
     /// Sequence-number horizon: records with `seq < horizon` are visible.
     horizon: u64,
-    inner: Arc<DbInner>,
+    inner: Arc<DbInner<F>>,
 }
 
-impl Drop for Snapshot {
+impl<F: Fs> Drop for Snapshot<F> {
     fn drop(&mut self) {
         let mut snapshots = self.inner.snapshots.lock();
         if let Some(count) = snapshots.get_mut(&self.horizon) {
@@ -441,7 +507,7 @@ impl Drop for Snapshot {
     }
 }
 
-impl DbInner {
+impl<F: Fs> DbInner<F> {
     /// Latch the first failure and return the error every later call will see.
     ///
     /// Only the first is kept: everything after it is a consequence, and the
@@ -582,14 +648,14 @@ impl DbInner {
         let tmp_path = final_path.with_extension("db.tmp");
 
         let records: Vec<Record> = frozen.iter().cloned().collect();
-        SsTableWriter::write(&tmp_path, &records)?;
+        SsTableWriter::write(&self.fs, &tmp_path, &records)?;
         // Atomic publish: a crash before the rename leaves only a stale .tmp.
         // The writer already fsynced the file's contents; this makes its *name*
         // durable, which is a separate thing and the one the manifest is about
         // to depend on.
-        fs::rename(&tmp_path, &final_path)?;
-        fsutil::sync_dir(&self.dir)?;
-        let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
+        self.fs.rename(&tmp_path, &final_path)?;
+        self.fs.sync_dir(&self.dir)?;
+        let reader = SsTableReader::open(&self.fs, &final_path, self.opts.bloom_enabled)?;
 
         // Record the new table in the manifest *before* truncating the WAL:
         // the WAL still backs these records until the manifest makes the
@@ -622,13 +688,13 @@ impl DbInner {
             let mut wal = self.wal.lock();
             let active = self.active.read();
             let tmp_path = self.dir.join(WAL_TMP_FILENAME);
-            let mut fresh = Wal::create(&tmp_path, self.opts.sync_wal)?;
+            let mut fresh = Wal::create(&self.fs, &tmp_path, self.opts.sync_wal)?;
             for record in active.iter() {
                 fresh.append(record)?;
             }
             fresh.sync()?;
-            fresh.rename_to(self.dir.join(WAL_FILENAME))?;
-            fsutil::sync_dir(&self.dir)?;
+            fresh.rename_to(&self.fs, self.dir.join(WAL_FILENAME))?;
+            self.fs.sync_dir(&self.dir)?;
             *wal = fresh;
         }
         *self.frozen.write() = None;
@@ -652,10 +718,12 @@ impl DbInner {
         let _compaction_guard = self.compaction_lock.lock();
 
         let tables = self.sstables.read().clone();
-        let Some((start, end)) = pick_compaction(&tables, self.opts.compaction_threshold)? else {
+        let Some((start, end)) =
+            pick_compaction(&self.fs, &tables, self.opts.compaction_threshold)?
+        else {
             return Ok(false);
         };
-        let run: Vec<Arc<SsTable>> = tables[start..end].to_vec();
+        let run: Vec<Arc<SsTable<F>>> = tables[start..end].to_vec();
         // The merged table reuses the run's highest id, keeping it in the same
         // position in the live set; the manifest makes the swap crash-safe.
         let Some(last) = run.last() else {
@@ -671,19 +739,25 @@ impl DbInner {
         let final_path = sst_path(&self.dir, max_id);
         let tmp_path = final_path.with_extension("db.tmp");
         {
-            let inputs: Vec<&SsTableReader> = run.iter().map(|t| &t.reader).collect();
-            compaction::compact(&tmp_path, &inputs, drop_tombstones, min_snapshot_seq)?;
+            let inputs: Vec<&SsTableReader<F>> = run.iter().map(|t| &t.reader).collect();
+            compaction::compact(
+                &self.fs,
+                &tmp_path,
+                &inputs,
+                drop_tombstones,
+                min_snapshot_seq,
+            )?;
         }
 
         // Publish: rename over the max-id input, drop the rest from the
         // manifest, splice the live set, then unlink the stale files.
         {
             let _flush_guard = self.flush_lock.lock();
-            fs::rename(&tmp_path, &final_path)?;
+            self.fs.rename(&tmp_path, &final_path)?;
             // Before the DeleteTable edits below: the merged output has to be
             // durable at its name before the manifest says its inputs are gone.
-            fsutil::sync_dir(&self.dir)?;
-            let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
+            self.fs.sync_dir(&self.dir)?;
+            let reader = SsTableReader::open(&self.fs, &final_path, self.opts.bloom_enabled)?;
 
             let stale_ids: Vec<u64> = run[..run.len() - 1].iter().map(|t| t.id).collect();
             self.manifest.lock().append_batch(
@@ -709,18 +783,18 @@ impl DbInner {
             *self.sstables.write() = Arc::new(next);
 
             for id in &stale_ids {
-                fs::remove_file(sst_path(&self.dir, *id))?;
+                self.fs.remove(&sst_path(&self.dir, *id))?;
             }
             // Hygiene only, and one fsync for the whole batch: a lost unlink is
             // a space leak the next open reclaims, not a correctness problem.
-            fsutil::sync_dir(&self.dir)?;
+            self.fs.sync_dir(&self.dir)?;
         }
         Ok(true)
     }
 }
 
 /// Background worker: drains flush requests until the [`Db`] is dropped.
-fn worker_loop(rx: Receiver<Task>, inner: Weak<DbInner>) {
+fn worker_loop<F: Fs>(rx: Receiver<Task>, inner: Weak<DbInner<F>>) {
     while let Ok(task) = rx.recv() {
         match task {
             Task::Shutdown => break,
@@ -738,13 +812,17 @@ fn worker_loop(rx: Receiver<Task>, inner: Weak<DbInner>) {
 
 /// Pick a contiguous, id-ordered run of `threshold`+ SSTables that fall in the
 /// same size tier, returning its `start..end` range.
-fn pick_compaction(tables: &[Arc<SsTable>], threshold: usize) -> Result<Option<(usize, usize)>> {
+fn pick_compaction<F: Fs>(
+    fs: &F,
+    tables: &[Arc<SsTable<F>>],
+    threshold: usize,
+) -> Result<Option<(usize, usize)>> {
     if tables.len() < threshold {
         return Ok(None);
     }
     let mut tiers = Vec::with_capacity(tables.len());
     for t in tables {
-        let len = fs::metadata(t.reader.path())?.len();
+        let len = fs.size(t.reader.path())?;
         // Tier = bit-width of the file size, i.e. floor(log2)+1.
         tiers.push(64 - len.leading_zeros());
     }
@@ -984,7 +1062,7 @@ mod tests {
 
         // A stray SSTable not named by the manifest must be reclaimed on open.
         let orphan = dir.path().join("sst_0000009999.db");
-        fs::copy(sst_path(dir.path(), 0), &orphan).unwrap();
+        std::fs::copy(sst_path(dir.path(), 0), &orphan).unwrap();
         let db = Db::open_with(dir.path(), fast_opts()).unwrap();
         assert!(!orphan.exists());
         assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
@@ -999,11 +1077,11 @@ mod tests {
             db.flush().unwrap();
         }
         // Simulate a Phase 2 layout: drop the manifest, keep the SSTable.
-        fs::remove_file(dir.path().join("CURRENT")).unwrap();
-        for entry in fs::read_dir(dir.path()).unwrap() {
+        std::fs::remove_file(dir.path().join("CURRENT")).unwrap();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
             let name = entry.unwrap().file_name();
             if name.to_string_lossy().starts_with("MANIFEST-") {
-                fs::remove_file(dir.path().join(name)).unwrap();
+                std::fs::remove_file(dir.path().join(name)).unwrap();
             }
         }
         let db = Db::open_with(dir.path(), fast_opts()).unwrap();

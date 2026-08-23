@@ -14,12 +14,10 @@
 //! recoverable even across a crash mid-rollover.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::fsutil::sync_dir;
+use crate::fs::{BufAppend, File as _, Fs, OpenMode};
 
 const CURRENT_FILENAME: &str = "CURRENT";
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
@@ -100,49 +98,45 @@ impl ManifestState {
 }
 
 /// An append-only manifest log open for writing.
-pub struct Manifest {
+pub struct Manifest<F: Fs> {
     dir: PathBuf,
     generation: u64,
-    file: BufWriter<File>,
+    file: BufAppend<F::File>,
 }
 
-impl Manifest {
+impl<F: Fs> Manifest<F> {
     /// Whether a database at `dir` already has a manifest.
-    pub fn exists(dir: &Path) -> bool {
-        dir.join(CURRENT_FILENAME).exists()
+    pub fn exists(fs: &F, dir: &Path) -> bool {
+        fs.exists(&dir.join(CURRENT_FILENAME))
     }
 
     /// Open the existing manifest at `dir`, replay it, and roll it over into a
     /// fresh compacted generation. Returns the writer and the replayed state.
-    pub fn open(dir: &Path) -> Result<(Manifest, ManifestState)> {
-        let generation = read_current(dir)?;
-        let state = replay(&manifest_path(dir, generation))?;
-        let mut manifest = Manifest {
+    pub fn open(fs: &F, dir: &Path) -> Result<(Manifest<F>, ManifestState)> {
+        let generation = read_current(fs, dir)?;
+        let state = replay(fs, &manifest_path(dir, generation))?;
+        let mut manifest = Manifest::<F> {
             dir: dir.to_path_buf(),
             generation,
-            file: BufWriter::new(open_append(&manifest_path(dir, generation))?),
+            file: BufAppend::new(fs.open(&manifest_path(dir, generation), OpenMode::Append)?),
         };
         // Compact the log so it never grows across the lifetime of the dir.
-        manifest.rollover(&state)?;
+        manifest.rollover(fs, &state)?;
         Ok((manifest, state))
     }
 
     /// Create a fresh, empty manifest at `dir` (generation 0) and point
     /// `CURRENT` at it. Used on first open and during Phase 2 migration.
-    pub fn create(dir: &Path) -> Result<Manifest> {
+    pub fn create(fs: &F, dir: &Path) -> Result<Manifest<F>> {
         let generation = 0;
         let path = manifest_path(dir, generation);
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        file.sync_all()?;
-        write_current(dir, generation)?;
+        let mut file = fs.open(&path, OpenMode::Truncate)?;
+        file.sync()?;
+        write_current(fs, dir, generation)?;
         Ok(Manifest {
             dir: dir.to_path_buf(),
             generation,
-            file: BufWriter::new(file),
+            file: BufAppend::new(file),
         })
     }
 
@@ -151,41 +145,34 @@ impl Manifest {
         for edit in edits {
             let payload = edit.encode();
             let crc = crc32fast::hash(&payload);
-            self.file.write_all(&crc.to_le_bytes())?;
-            self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            self.file.write_all(&payload)?;
+            self.file.write(&crc.to_le_bytes())?;
+            self.file.write(&(payload.len() as u32).to_le_bytes())?;
+            self.file.write(&payload)?;
         }
-        self.file.flush()?;
-        self.file.get_ref().sync_all()?;
+        self.file.sync()?;
         Ok(())
     }
 
     /// Write `state` into a fresh manifest generation and atomically swap
     /// `CURRENT` to point at it, then delete the previous generation.
-    pub fn rollover(&mut self, state: &ManifestState) -> Result<()> {
+    pub fn rollover(&mut self, fs: &F, state: &ManifestState) -> Result<()> {
         let old_gen = self.generation;
         let new_gen = old_gen + 1;
         let new_path = manifest_path(&self.dir, new_gen);
 
-        let mut writer = Manifest {
+        let mut writer = Manifest::<F> {
             dir: self.dir.clone(),
             generation: new_gen,
-            file: BufWriter::new(
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&new_path)?,
-            ),
+            file: BufAppend::new(fs.open(&new_path, OpenMode::Truncate)?),
         };
         writer.append_batch(&state.snapshot_edits())?;
 
         // Atomic publish: CURRENT now names the new, durable generation.
-        write_current(&self.dir, new_gen)?;
+        write_current(fs, &self.dir, new_gen)?;
 
         self.generation = new_gen;
         self.file = writer.file;
-        let _ = fs::remove_file(manifest_path(&self.dir, old_gen));
+        let _ = fs.remove(&manifest_path(&self.dir, old_gen));
         Ok(())
     }
 }
@@ -194,13 +181,12 @@ fn manifest_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("MANIFEST-{generation:06}"))
 }
 
-fn open_append(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new().append(true).create(true).open(path)?)
-}
-
 /// Read the generation number named by `CURRENT`.
-fn read_current(dir: &Path) -> Result<u64> {
-    let raw = fs::read_to_string(dir.join(CURRENT_FILENAME))?;
+fn read_current<F: Fs>(fs: &F, dir: &Path) -> Result<u64> {
+    let bytes = fs
+        .open(&dir.join(CURRENT_FILENAME), OpenMode::Read)?
+        .read_all()?;
+    let raw = String::from_utf8_lossy(&bytes);
     let name = raw.trim();
     name.strip_prefix("MANIFEST-")
         .and_then(|g| g.parse().ok())
@@ -208,29 +194,26 @@ fn read_current(dir: &Path) -> Result<u64> {
 }
 
 /// Atomically point `CURRENT` at `MANIFEST-<generation>` via a rename.
-fn write_current(dir: &Path, generation: u64) -> Result<()> {
+fn write_current<F: Fs>(fs: &F, dir: &Path, generation: u64) -> Result<()> {
     let tmp = dir.join("CURRENT.tmp");
     {
-        let mut f = File::create(&tmp)?;
-        writeln!(f, "MANIFEST-{generation:06}")?;
-        f.sync_all()?;
+        let mut f = fs.open(&tmp, OpenMode::Truncate)?;
+        f.append(format!("MANIFEST-{generation:06}\n").as_bytes())?;
+        f.sync()?;
     }
-    fs::rename(&tmp, dir.join(CURRENT_FILENAME))?;
-    sync_dir(dir)?;
+    fs.rename(&tmp, &dir.join(CURRENT_FILENAME))?;
+    fs.sync_dir(dir)?;
     Ok(())
 }
 
 /// Replay a manifest file into a [`ManifestState`], tolerating a torn trailing
 /// frame from a crash mid-append.
-fn replay(path: &Path) -> Result<ManifestState> {
-    let mut bytes = Vec::new();
-    match File::open(path) {
-        Ok(mut f) => {
-            f.read_to_end(&mut bytes)?;
-        }
+fn replay<F: Fs>(fs: &F, path: &Path) -> Result<ManifestState> {
+    let bytes = match fs.open(path, OpenMode::Read) {
+        Ok(f) => f.read_all()?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ManifestState::default()),
         Err(e) => return Err(e.into()),
-    }
+    };
 
     let mut state = ManifestState::default();
     let mut pos = 0;
@@ -255,12 +238,13 @@ fn replay(path: &Path) -> Result<ManifestState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::StdFs;
 
     #[test]
     fn create_open_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut m = Manifest::create(dir.path()).unwrap();
+            let mut m = Manifest::create(&StdFs, dir.path()).unwrap();
             m.append_batch(&[
                 VersionEdit::AddTable { id: 1 },
                 VersionEdit::AddTable { id: 2 },
@@ -269,7 +253,7 @@ mod tests {
             ])
             .unwrap();
         }
-        let (_m, state) = Manifest::open(dir.path()).unwrap();
+        let (_m, state) = Manifest::open(&StdFs, dir.path()).unwrap();
         assert_eq!(state.live_tables, BTreeSet::from([1, 2]));
         assert_eq!(state.next_seq, 42);
         assert_eq!(state.next_sst_id, 3);
@@ -279,7 +263,7 @@ mod tests {
     fn delete_table_removes_from_live_set() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut m = Manifest::create(dir.path()).unwrap();
+            let mut m = Manifest::create(&StdFs, dir.path()).unwrap();
             m.append_batch(&[
                 VersionEdit::AddTable { id: 1 },
                 VersionEdit::AddTable { id: 2 },
@@ -287,7 +271,7 @@ mod tests {
             ])
             .unwrap();
         }
-        let (_m, state) = Manifest::open(dir.path()).unwrap();
+        let (_m, state) = Manifest::open(&StdFs, dir.path()).unwrap();
         assert_eq!(state.live_tables, BTreeSet::from([2]));
     }
 
@@ -295,7 +279,7 @@ mod tests {
     fn rollover_compacts_and_preserves_state() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut m = Manifest::create(dir.path()).unwrap();
+            let mut m = Manifest::create(&StdFs, dir.path()).unwrap();
             for id in 0..10 {
                 m.append_batch(&[VersionEdit::AddTable { id }]).unwrap();
             }
@@ -305,7 +289,7 @@ mod tests {
             m.append_batch(&[VersionEdit::SetNextSeq(100)]).unwrap();
         }
         // open() rolls over to a fresh generation.
-        let (_m, state) = Manifest::open(dir.path()).unwrap();
+        let (_m, state) = Manifest::open(&StdFs, dir.path()).unwrap();
         assert_eq!(state.live_tables, BTreeSet::from([8, 9]));
         assert_eq!(state.next_seq, 100);
         // Generation 0 is gone after the open-time rollover.
@@ -317,16 +301,16 @@ mod tests {
     fn torn_trailing_frame_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut m = Manifest::create(dir.path()).unwrap();
+            let mut m = Manifest::create(&StdFs, dir.path()).unwrap();
             m.append_batch(&[VersionEdit::AddTable { id: 7 }]).unwrap();
         }
         let path = manifest_path(dir.path(), 0);
-        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let len = f.metadata().unwrap().len();
         f.set_len(len - 2).unwrap();
         f.sync_all().unwrap();
 
-        let state = replay(&path).unwrap();
+        let state = replay(&StdFs, &path).unwrap();
         assert!(state.live_tables.is_empty());
     }
 }

@@ -456,6 +456,39 @@ impl<F: Fs> Db<F> {
         self.inner.get_at(key, u64::MAX)
     }
 
+    /// Every live key in `start..end`, ascending, at most `limit` of them.
+    ///
+    /// Half-open: `start` is included, `end` is excluded, and `None` means
+    /// unbounded on that side. A `limit` of zero returns nothing.
+    ///
+    /// The work is proportional to what is returned rather than to what is
+    /// stored: each SSTable is walked one block at a time from the block that
+    /// brackets `start`, so a scan of ten keys out of a million decompresses one
+    /// block per table.
+    ///
+    /// Deleted keys are absent rather than present-and-empty. A tombstone is a
+    /// record like any other and shadows what is beneath it, but it is not a
+    /// result.
+    pub fn scan(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_at(start, end, limit, u64::MAX)
+    }
+
+    /// [`Db::scan`] as of `snapshot`.
+    pub fn scan_at(
+        &self,
+        snapshot: &Snapshot<F>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan_at(start, end, limit, snapshot.horizon)
+    }
+
     /// Flush the MemTable to a new SSTable and start a fresh WAL, then run any
     /// pending compaction — all synchronously. A no-op if the MemTable is
     /// empty.
@@ -691,6 +724,55 @@ impl<F: Fs> DbInner<F> {
             }
         }
         Ok(None)
+    }
+
+    /// Merge a key range across the MemTables and every SSTable.
+    fn scan_at(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        seq_bound: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.health()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // The MemTables are copied out rather than borrowed. Holding their
+        // locks for the length of a scan would block every writer for as long
+        // as the caller took to consume it, and a scan is bounded by `limit`
+        // whereas a writer's patience is not.
+        let mut sources: Vec<std::vec::IntoIter<crate::scan::Item>> = Vec::new();
+        let from_memtable = |table: &MemTable| -> Vec<crate::scan::Item> {
+            table.range(start, end).cloned().map(Ok).collect()
+        };
+        sources.push(from_memtable(&self.active.read()).into_iter());
+        if let Some(frozen) = self.frozen.read().clone() {
+            sources.push(from_memtable(&frozen).into_iter());
+        }
+
+        // The SSTables are held open for the length of the scan, which is what
+        // the `Arc` snapshot of the live set is for: a compaction that unlinks
+        // one mid-scan cannot pull the file out from under it.
+        let sstables = self.sstables.read().clone();
+        let mut merged: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut all: Vec<Box<dyn Iterator<Item = crate::scan::Item> + '_>> = sources
+                .into_iter()
+                .map(|s| Box::new(s) as Box<dyn Iterator<Item = crate::scan::Item>>)
+                .collect();
+            for table in sstables.iter() {
+                all.push(Box::new(table.reader.scan(start)));
+            }
+            for item in crate::scan::Merge::new(all, seq_bound, end.map(|e| e.to_vec())) {
+                merged.push(item?);
+                if merged.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// The lowest sequence-number horizon any live snapshot can observe, or

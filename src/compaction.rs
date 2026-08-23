@@ -101,7 +101,7 @@ pub fn compact(
             j += 1;
         }
         let mut group: Vec<Record> = stream[i..j].to_vec();
-        group.sort_by(|a, b| b.seq.cmp(&a.seq)); // seq-descending
+        group.sort_by_key(|r| std::cmp::Reverse(r.seq)); // seq-descending
 
         let mut kept: Vec<Record> = Vec::new();
         let mut newest_below_taken = false;

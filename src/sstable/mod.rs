@@ -76,9 +76,7 @@ impl SsTableWriter {
             record.encode_into(&mut block);
             // Never split a key's versions across blocks: a seq-aware lookup
             // scans only the one block the binary search lands on.
-            let next_differs = records
-                .get(i + 1)
-                .map_or(true, |next| next.key != record.key);
+            let next_differs = records.get(i + 1).is_none_or(|next| next.key != record.key);
             if block.len() >= BLOCK_SIZE && next_differs {
                 flush_block(
                     &mut block,

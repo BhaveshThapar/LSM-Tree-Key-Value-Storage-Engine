@@ -32,10 +32,8 @@ pub(crate) fn compaction_loop(rx: Receiver<CompactMsg>, inner: Weak<DbInner>) {
                     match inner.compact_step() {
                         Ok(true) => continue,
                         Ok(false) => break,
-                        Err(e) => {
-                            eprintln!("lsm: background compaction failed: {e}");
-                            break;
-                        }
+                        // compact_step has latched it; retrying cannot help.
+                        Err(_) => break,
                     }
                 }
             }

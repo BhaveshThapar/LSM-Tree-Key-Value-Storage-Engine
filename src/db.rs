@@ -121,6 +121,8 @@ pub(crate) struct DbInner {
     worker_tx: Sender<Task>,
     /// Triggers background compaction.
     compact_tx: Sender<CompactMsg>,
+    /// Latched first failure. Set once and never cleared: see [`Error::Poisoned`].
+    failed: RwLock<Option<Arc<crate::error::Error>>>,
 }
 
 /// An embedded LSM-tree key/value store.
@@ -222,6 +224,7 @@ impl Db {
             snapshots: Mutex::new(BTreeMap::new()),
             worker_tx: flush_tx.clone(),
             compact_tx: compact_tx.clone(),
+            failed: RwLock::new(None),
         });
 
         let flush_weak = Arc::downgrade(&inner);
@@ -291,6 +294,17 @@ impl Db {
         Ok(())
     }
 
+    /// `Err` once a flush or a compaction has failed.
+    ///
+    /// The engine does not recover in-process: a failed flush leaves the frozen
+    /// MemTable stranded and the WAL un-rewritten, so everything written after
+    /// it is building on state that will not survive a restart. A caller that
+    /// replicates — or that simply wants to fail loudly rather than quietly —
+    /// should poll this and reopen the directory.
+    pub fn health(&self) -> Result<()> {
+        self.inner.health()
+    }
+
     /// Number of immutable SSTables currently on disk.
     pub fn sstable_count(&self) -> usize {
         self.inner.sstables.read().len()
@@ -338,8 +352,34 @@ impl Drop for Snapshot {
 }
 
 impl DbInner {
+    /// Latch the first failure and return the error every later call will see.
+    ///
+    /// Only the first is kept: everything after it is a consequence, and the
+    /// first one is the one that says what went wrong.
+    fn fail(&self, e: crate::error::Error) -> crate::error::Error {
+        let mut slot = self.failed.write();
+        if slot.is_none() {
+            eprintln!("lsm: engine failed and will not recover in this process: {e}");
+            *slot = Some(Arc::new(e));
+        }
+        crate::error::Error::Poisoned(
+            slot.as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        )
+    }
+
+    /// `Err` once a flush or a compaction has failed.
+    pub(crate) fn health(&self) -> Result<()> {
+        match self.failed.read().as_ref() {
+            Some(e) => Err(crate::error::Error::Poisoned(e.to_string())),
+            None => Ok(()),
+        }
+    }
+
     /// Append a mutation to the WAL and the active MemTable.
     fn write(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<()> {
+        self.health()?;
         let trigger_flush;
         {
             // Hold the WAL lock across the MemTable insert so the record's WAL
@@ -366,6 +406,11 @@ impl DbInner {
     /// SSTables newest-to-oldest. Only records with `seq < seq_bound` are
     /// visible — `u64::MAX` resolves the latest value.
     fn get_at(&self, key: &[u8], seq_bound: u64) -> Result<Option<Vec<u8>>> {
+        // Reads refuse as well as writes. A handle whose flush failed is
+        // serving from a MemTable whose contents are not going to survive a
+        // restart, and answering a read from it is a durability claim the
+        // engine can no longer make.
+        self.health()?;
         if let Some(record) = self.active.read().get_at(key, seq_bound) {
             return Ok(record.value.clone());
         }
@@ -398,6 +443,11 @@ impl DbInner {
     /// Freeze the active MemTable, write it to a new SSTable, publish it, and
     /// rewrite the WAL to back only the records written since the freeze.
     fn flush_inner(&self) -> Result<()> {
+        self.health()?;
+        self.flush_impl().map_err(|e| self.fail(e))
+    }
+
+    fn flush_impl(&self) -> Result<()> {
         let _flush_guard = self.flush_lock.lock();
 
         // Freeze: swap the active MemTable for a fresh one. The frozen slot is
@@ -468,6 +518,11 @@ impl DbInner {
     /// The heavy merge writes the output SSTable without any lock held; only
     /// the publish step takes `flush_lock`, so flushes proceed concurrently.
     pub(crate) fn compact_step(&self) -> Result<bool> {
+        self.health()?;
+        self.compact_step_impl().map_err(|e| self.fail(e))
+    }
+
+    fn compact_step_impl(&self) -> Result<bool> {
         let _compaction_guard = self.compaction_lock.lock();
 
         let tables = self.sstables.read().clone();
@@ -535,8 +590,10 @@ fn worker_loop(rx: Receiver<Task>, inner: Weak<DbInner>) {
             Task::Shutdown => break,
             Task::Flush => {
                 let Some(inner) = inner.upgrade() else { break };
-                if let Err(e) = inner.flush_inner() {
-                    eprintln!("lsm: background flush failed: {e}");
+                if inner.flush_inner().is_err() {
+                    // flush_inner has latched it. Continuing would retry a
+                    // flush that cannot succeed, once per write, forever.
+                    break;
                 }
             }
         }
@@ -581,6 +638,7 @@ fn parse_sst_id(name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     fn fast_opts() -> Options {
         Options {
@@ -936,6 +994,43 @@ mod tests {
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v3".to_vec()));
         assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn a_failed_flush_poisons_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        // Occupy the path the flush will write its SSTable to, with something
+        // File::create cannot open.
+        std::fs::create_dir(sst_path(dir.path(), 0).with_extension("db.tmp")).unwrap();
+
+        assert!(db.flush().is_err());
+
+        // The frozen MemTable is stranded and the WAL was never rewritten.
+        // Continuing to accept writes would build on state that is not going to
+        // survive a restart, so every entry point refuses from here on.
+        assert!(matches!(db.health(), Err(Error::Poisoned(_))));
+        assert!(matches!(db.put(b"k2", b"v"), Err(Error::Poisoned(_))));
+        assert!(matches!(db.delete(b"k"), Err(Error::Poisoned(_))));
+        assert!(matches!(db.get(b"k"), Err(Error::Poisoned(_))));
+        assert!(matches!(db.flush(), Err(Error::Poisoned(_))));
+    }
+
+    #[test]
+    fn only_the_first_failure_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+
+        db.inner.fail(Error::Corrupt("first".into()));
+        db.inner.fail(Error::Corrupt("second".into()));
+
+        // Everything after the first is a consequence of it.
+        match db.health() {
+            Err(Error::Poisoned(msg)) => assert!(msg.contains("first"), "got {msg}"),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
     }
 
     #[test]

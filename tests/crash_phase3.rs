@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use lsm_kv::{Db, Options};
+use lsm_kv::{Db, Options, SyncMode};
 
 const CHILD_ENV: &str = "LSM_PHASE3_CHILD";
 const DIR_ENV: &str = "LSM_PHASE3_DIR";
@@ -17,7 +17,7 @@ const DIR_ENV: &str = "LSM_PHASE3_DIR";
 fn opts() -> Options {
     Options {
         memtable_threshold: 4 * 1024,
-        sync_wal: true,
+        sync_wal: SyncMode::Durable,
         compaction_threshold: 4,
         ..Options::default()
     }

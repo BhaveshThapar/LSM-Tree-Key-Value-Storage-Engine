@@ -24,8 +24,15 @@ use crate::error::{Error, Result};
 /// Bytes at the front of a WAL or manifest file.
 pub(crate) const HEADER_LEN: usize = 8;
 
-/// Format version written by this build.
-pub(crate) const VERSION: u16 = 1;
+/// Format version of the write-ahead log written by this build.
+///
+/// Version 1 held one record per frame. Version 2 holds a count and then that
+/// many records, so a batch is one frame under one CRC and a crash either takes
+/// all of it or none of it.
+pub(crate) const WAL_VERSION: u16 = 2;
+
+/// Format version of the manifest written by this build.
+pub(crate) const MANIFEST_VERSION: u16 = 1;
 
 /// Marks the front of a write-ahead log.
 pub(crate) const WAL_MAGIC: &[u8; 4] = b"LSMW";
@@ -52,10 +59,10 @@ pub(crate) enum Kind {
 }
 
 /// The eight bytes to write at the front of a new file.
-pub(crate) fn encode(magic: &[u8; 4]) -> [u8; HEADER_LEN] {
+pub(crate) fn encode(magic: &[u8; 4], version: u16) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
     out[0..4].copy_from_slice(magic);
-    out[4..6].copy_from_slice(&VERSION.to_le_bytes());
+    out[4..6].copy_from_slice(&version.to_le_bytes());
     // `reserved` stays zero. It exists so a flag can be added without moving
     // where the frames start, which is the one thing a header must never do.
     out
@@ -64,15 +71,15 @@ pub(crate) fn encode(magic: &[u8; 4]) -> [u8; HEADER_LEN] {
 /// Classify the front of a file.
 ///
 /// `bytes` is the whole file, because both callers already hold it.
-pub(crate) fn classify(bytes: &[u8], magic: &[u8; 4], what: &str) -> Result<Kind> {
+pub(crate) fn classify(bytes: &[u8], magic: &[u8; 4], newest: u16, what: &str) -> Result<Kind> {
     if bytes.is_empty() {
         return Ok(Kind::Empty);
     }
     if bytes.len() >= HEADER_LEN && &bytes[0..4] == magic {
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version > VERSION {
+        if version > newest {
             return Err(Error::BadFormat(format!(
-                "{what} is version {version}; this build understands up to {VERSION}"
+                "{what} is version {version}; this build understands up to {newest}"
             )));
         }
         return Ok(Kind::Versioned(version));
@@ -102,17 +109,20 @@ mod tests {
 
     #[test]
     fn a_written_header_classifies_as_this_version() {
-        let bytes = encode(WAL_MAGIC);
+        let bytes = encode(WAL_MAGIC, WAL_VERSION);
         assert_eq!(
-            classify(&bytes, WAL_MAGIC, "wal").unwrap(),
-            Kind::Versioned(VERSION)
+            classify(&bytes, WAL_MAGIC, WAL_VERSION, "wal").unwrap(),
+            Kind::Versioned(WAL_VERSION)
         );
-        assert_eq!(frames_start(Kind::Versioned(VERSION)), HEADER_LEN);
+        assert_eq!(frames_start(Kind::Versioned(WAL_VERSION)), HEADER_LEN);
     }
 
     #[test]
     fn an_empty_file_is_empty_rather_than_legacy() {
-        assert_eq!(classify(&[], WAL_MAGIC, "wal").unwrap(), Kind::Empty);
+        assert_eq!(
+            classify(&[], WAL_MAGIC, WAL_VERSION, "wal").unwrap(),
+            Kind::Empty
+        );
     }
 
     #[test]
@@ -120,7 +130,10 @@ mod tests {
         // Four bytes of CRC and four of length: what a pre-header frame starts
         // with.
         let bytes = [0xde, 0xad, 0xbe, 0xef, 4, 0, 0, 0];
-        assert_eq!(classify(&bytes, WAL_MAGIC, "wal").unwrap(), Kind::Legacy);
+        assert_eq!(
+            classify(&bytes, WAL_MAGIC, WAL_VERSION, "wal").unwrap(),
+            Kind::Legacy
+        );
         assert_eq!(frames_start(Kind::Legacy), 0);
     }
 
@@ -128,15 +141,18 @@ mod tests {
     /// manifest is not a WAL however similar their frames look.
     #[test]
     fn the_other_files_magic_is_not_accepted() {
-        let bytes = encode(MANIFEST_MAGIC);
-        assert_eq!(classify(&bytes, WAL_MAGIC, "wal").unwrap(), Kind::Legacy);
+        let bytes = encode(MANIFEST_MAGIC, MANIFEST_VERSION);
+        assert_eq!(
+            classify(&bytes, WAL_MAGIC, WAL_VERSION, "wal").unwrap(),
+            Kind::Legacy
+        );
     }
 
     #[test]
     fn a_version_from_the_future_is_refused_rather_than_guessed_at() {
-        let mut bytes = encode(WAL_MAGIC);
-        bytes[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
-        let err = classify(&bytes, WAL_MAGIC, "wal").unwrap_err();
+        let mut bytes = encode(WAL_MAGIC, WAL_VERSION);
+        bytes[4..6].copy_from_slice(&(WAL_VERSION + 1).to_le_bytes());
+        let err = classify(&bytes, WAL_MAGIC, WAL_VERSION, "wal").unwrap_err();
         assert!(
             matches!(err, Error::BadFormat(_)),
             "a future version gave {err:?} rather than BadFormat"
@@ -147,6 +163,9 @@ mod tests {
     /// a truncated one.
     #[test]
     fn a_file_shorter_than_a_header_is_legacy_not_a_bad_header() {
-        assert_eq!(classify(b"LSM", WAL_MAGIC, "wal").unwrap(), Kind::Legacy);
+        assert_eq!(
+            classify(b"LSM", WAL_MAGIC, WAL_VERSION, "wal").unwrap(),
+            Kind::Legacy
+        );
     }
 }

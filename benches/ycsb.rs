@@ -5,7 +5,7 @@
 //! the throughput numbers are directly comparable.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use lsm_kv::{Db, Options};
+use lsm_kv::{Db, Options, SyncMode};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -71,7 +71,7 @@ fn workload(read_frac: f64, zipfian: bool, seed: u64) -> Vec<Op> {
 fn fresh_lsm() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().unwrap();
     let opts = Options {
-        sync_wal: false,
+        sync_wal: SyncMode::None,
         ..Options::default()
     };
     let db = Db::open_with(dir.path(), opts).unwrap();

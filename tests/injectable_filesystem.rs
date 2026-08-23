@@ -22,13 +22,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lsm_kv::{Db, File, Fs, Maintenance, OpenMode, Options, StdFs};
+use lsm_kv::{Db, File, Fs, Maintenance, OpenMode, Options, StdFs, SyncMode};
 
 fn manual_opts() -> Options {
     Options {
         memtable_threshold: 512,
         compaction_threshold: 2,
-        sync_wal: false,
+        sync_wal: SyncMode::None,
         maintenance: Maintenance::Manual,
         ..Options::default()
     }
@@ -167,7 +167,8 @@ impl File for MemFile {
         self.bytes.borrow_mut().extend_from_slice(buf);
         Ok(())
     }
-    fn sync(&mut self) -> io::Result<()> {
+    fn sync_as(&mut self, _mode: SyncMode) -> io::Result<()> {
+        // Nothing to make durable: there is no device under this.
         Ok(())
     }
     fn size(&self) -> io::Result<u64> {
@@ -328,8 +329,8 @@ impl File for MaybeFailingFile {
         }
         self.inner.append(buf)
     }
-    fn sync(&mut self) -> io::Result<()> {
-        self.inner.sync()
+    fn sync_as(&mut self, mode: SyncMode) -> io::Result<()> {
+        self.inner.sync_as(mode)
     }
     fn size(&self) -> io::Result<u64> {
         self.inner.size()

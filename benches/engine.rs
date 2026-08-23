@@ -2,7 +2,7 @@
 //! hot/cold point reads, the Bloom-filter read win, and post-compaction reads.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use lsm_kv::{Db, Options};
+use lsm_kv::{Db, Options, SyncMode};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -29,7 +29,7 @@ fn bench_writes(c: &mut Criterion) {
     group.bench_function("put", |b| {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             ..Options::default()
         };
         let db = Db::open_with(dir.path(), opts).unwrap();
@@ -45,7 +45,7 @@ fn bench_writes(c: &mut Criterion) {
 fn bench_point_reads(c: &mut Criterion) {
     let n = 100_000u64;
     let opts = Options {
-        sync_wal: false,
+        sync_wal: SyncMode::None,
         ..Options::default()
     };
     let (_dir, db) = loaded_db(opts, n);
@@ -65,7 +65,7 @@ fn bench_point_reads(c: &mut Criterion) {
 fn bench_bloom_off(c: &mut Criterion) {
     let n = 100_000u64;
     let opts = Options {
-        sync_wal: false,
+        sync_wal: SyncMode::None,
         bloom_enabled: false,
         ..Options::default()
     };
@@ -89,7 +89,7 @@ fn bench_post_compaction(c: &mut Criterion) {
                 // Force several flushes so a compaction runs.
                 let dir = tempfile::tempdir().unwrap();
                 let opts = Options {
-                    sync_wal: false,
+                    sync_wal: SyncMode::None,
                     compaction_threshold: 4,
                     ..Options::default()
                 };

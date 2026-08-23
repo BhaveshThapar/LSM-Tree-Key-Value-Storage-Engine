@@ -24,6 +24,35 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// How durable a sync has to be.
+///
+/// This is an enum rather than a call to [`std::fs::File::sync_all`] because
+/// that function is not the same operation on every platform. On Linux it is
+/// `fsync`; on macOS it is also `fsync`, and macOS `fsync` does **not** flush
+/// the drive's write cache. It is not a durability primitive there, and a
+/// benchmark run against it is measuring something other than what it claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// `fsync` on Linux, `F_FULLFSYNC` on macOS. Survives power loss, and the
+    /// only mode a durability claim may be made under.
+    #[default]
+    Durable,
+    /// `fsync` everywhere: ordering, not power-loss durability. Exists so that
+    /// development on a Mac is not unusably slow, and so an operator who has
+    /// decided their battery-backed controller makes the distinction moot can
+    /// say so.
+    Barrier,
+    /// No sync at all. Tests, and benchmarks that are labelled as unsafe.
+    None,
+}
+
+impl SyncMode {
+    /// Whether a durability claim may be made under this mode.
+    pub fn is_durable(self) -> bool {
+        matches!(self, SyncMode::Durable)
+    }
+}
+
 /// What a file is being opened for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
@@ -68,8 +97,14 @@ pub trait File: 'static {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize>;
     /// Append to the end of the file.
     fn append(&mut self, buf: &[u8]) -> io::Result<()>;
-    /// Make everything written so far durable.
-    fn sync(&mut self) -> io::Result<()>;
+    /// Make everything written so far durable, in the strongest sense the
+    /// platform offers.
+    fn sync(&mut self) -> io::Result<()> {
+        self.sync_as(SyncMode::Durable)
+    }
+
+    /// Make everything written so far durable to the degree `mode` asks for.
+    fn sync_as(&mut self, mode: SyncMode) -> io::Result<()>;
     fn size(&self) -> io::Result<u64>;
     fn set_len(&mut self, len: u64) -> io::Result<()>;
 
@@ -294,8 +329,12 @@ impl File for StdFile {
         self.file.write_all(buf)
     }
 
-    fn sync(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+    fn sync_as(&mut self, mode: SyncMode) -> io::Result<()> {
+        match mode {
+            SyncMode::None => Ok(()),
+            SyncMode::Barrier => self.file.sync_all(),
+            SyncMode::Durable => full_sync(&self.file),
+        }
     }
 
     fn size(&self) -> io::Result<u64> {
@@ -305,6 +344,36 @@ impl File for StdFile {
     fn set_len(&mut self, len: u64) -> io::Result<()> {
         self.file.set_len(len)
     }
+}
+
+/// The strongest durability the platform offers.
+///
+/// On macOS that is `F_FULLFSYNC`, which asks the drive to flush its write
+/// cache; plain `fsync` there returns once the data has reached the drive's
+/// cache and says nothing about power loss. On Linux `fsync` already is that,
+/// so there is nothing stronger to ask for.
+#[cfg(target_os = "macos")]
+fn full_sync(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `fcntl` with F_FULLFSYNC takes an open descriptor and no further
+    // arguments. The descriptor is open for as long as `file` is borrowed.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+    if rc == -1 {
+        // Some filesystems — network mounts especially — do not implement it.
+        // Falling back is honest as long as it is only on the platforms where
+        // there is nothing else to try.
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOTSUP) || err.raw_os_error() == Some(libc::EINVAL) {
+            return file.sync_all();
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn full_sync(file: &std::fs::File) -> io::Result<()> {
+    file.sync_all()
 }
 
 #[cfg(unix)]

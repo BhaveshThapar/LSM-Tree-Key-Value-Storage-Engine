@@ -19,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::compaction;
 use crate::compactor::{self, CompactMsg};
 use crate::error::Result;
-use crate::fs::{Fs, StdFs};
+use crate::fs::{Fs, StdFs, SyncMode};
 use crate::fsutil::{self, DirLock};
 use crate::manifest::{Manifest, ManifestState, VersionEdit};
 use crate::memtable::{DEFAULT_THRESHOLD, MemTable};
@@ -36,8 +36,12 @@ const WAL_TMP_FILENAME: &str = "wal.log.tmp";
 pub struct Options {
     /// MemTable size (bytes) at which an automatic flush is triggered.
     pub memtable_threshold: usize,
-    /// If true, `fsync` the WAL after every append (durable but slower).
-    pub sync_wal: bool,
+    /// How hard the WAL is synced after every append. See [`SyncMode`].
+    ///
+    /// Replaces an earlier `sync_wal: bool`, which could only say "fsync or
+    /// not" — and on macOS `fsync` is not a durability primitive at all, so the
+    /// `true` arm was making a promise the platform did not keep.
+    pub sync_wal: SyncMode,
     /// Number of similarly-sized, adjacent SSTables that triggers a
     /// size-tiered compaction of that run.
     pub compaction_threshold: usize,
@@ -75,11 +79,44 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             memtable_threshold: DEFAULT_THRESHOLD,
-            sync_wal: true,
+            sync_wal: SyncMode::Durable,
             compaction_threshold: 4,
             bloom_enabled: true,
             maintenance: Maintenance::default(),
         }
+    }
+}
+
+/// A set of mutations to apply together.
+///
+/// Order matters within a batch: two writes to one key leave the later one
+/// winning, the same as if they had been separate calls.
+#[derive(Debug, Clone, Default)]
+pub struct WriteBatch {
+    ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl WriteBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> &mut Self {
+        self.ops.push((key.to_vec(), Some(value.to_vec())));
+        self
+    }
+
+    pub fn delete(&mut self, key: &[u8]) -> &mut Self {
+        self.ops.push((key.to_vec(), None));
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 }
 
@@ -385,6 +422,35 @@ impl<F: Fs> Db<F> {
         self.inner.write(key, None)
     }
 
+    /// Apply every mutation in `batch`, all of them or none of them.
+    ///
+    /// The atomicity is the log format's rather than the filesystem's: the
+    /// whole batch is one length-prefixed frame under one CRC, so a crash
+    /// caught mid-write leaves a frame that does not verify and replay drops
+    /// every record in it. There is no interleaving in which half a batch
+    /// survives a restart.
+    ///
+    /// That is what makes it possible to keep an index and the data it
+    /// describes consistent across a crash — a replicated state machine's
+    /// applied position and the writes it describes, say — without a second
+    /// durability mechanism beside this one.
+    ///
+    /// One fsync for the whole batch. A hundred keys written one at a time cost
+    /// a hundred.
+    ///
+    /// ```no_run
+    /// # use lsm_kv::{Db, WriteBatch};
+    /// # let db = Db::open("./data")?;
+    /// let mut batch = WriteBatch::new();
+    /// batch.put(b"user/1", b"alice");
+    /// batch.put(b"meta/applied", &7u64.to_le_bytes());
+    /// db.write_batch(&batch)?;
+    /// # Ok::<(), lsm_kv::Error>(())
+    /// ```
+    pub fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
+        self.inner.write_batch(batch)
+    }
+
     /// Return the current value for `key`, or `None` if absent or deleted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.inner.get_at(key, u64::MAX)
@@ -550,6 +616,48 @@ impl<F: Fs> DbInner<F> {
             wal.append(&record)?;
             let mut active = self.active.write();
             active.insert(record);
+            trigger_flush = active.is_full();
+        }
+        if trigger_flush {
+            let _ = self.worker_tx.send(Task::Flush);
+        }
+        Ok(())
+    }
+
+    /// Append every mutation in `batch` to the WAL as one frame, then to the
+    /// active MemTable.
+    fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
+        self.health()?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let trigger_flush;
+        {
+            // The same lock discipline as a single write, and for the same
+            // reason: the frame and the in-memory records are published as one
+            // unit, so a concurrent flush rewriting the WAL cannot catch the
+            // batch half-way in.
+            let mut wal = self.wal.lock();
+            let first_seq = self
+                .next_seq
+                .fetch_add(batch.ops.len() as u64, Ordering::SeqCst);
+            let records: Vec<Record> = batch
+                .ops
+                .iter()
+                .enumerate()
+                .map(|(i, (key, value))| {
+                    let seq = first_seq + i as u64;
+                    match value {
+                        Some(v) => Record::put(key.clone(), v.clone(), seq),
+                        None => Record::tombstone(key.clone(), seq),
+                    }
+                })
+                .collect();
+            wal.append_batch(&records)?;
+            let mut active = self.active.write();
+            for record in records {
+                active.insert(record);
+            }
             trigger_flush = active.is_full();
         }
         if trigger_flush {
@@ -856,7 +964,7 @@ mod tests {
 
     fn fast_opts() -> Options {
         Options {
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             ..Options::default()
         }
     }
@@ -972,7 +1080,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
             memtable_threshold: 4 * 1024,
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             ..Options::default()
         };
         let db = Db::open_with(dir.path(), opts).unwrap();
@@ -992,7 +1100,7 @@ mod tests {
     fn compaction_reduces_table_count_and_preserves_data() {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             compaction_threshold: 4,
             ..Options::default()
         };
@@ -1034,7 +1142,7 @@ mod tests {
     fn compaction_keeps_newest_value_and_drops_deleted_key() {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             compaction_threshold: 3,
             ..Options::default()
         };
@@ -1095,7 +1203,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
             memtable_threshold: 16 * 1024,
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             ..Options::default()
         };
         let db = Arc::new(Db::open_with(dir.path(), opts).unwrap());
@@ -1129,7 +1237,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
             memtable_threshold: 8 * 1024,
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             compaction_threshold: 4,
             ..Options::default()
         };
@@ -1189,7 +1297,7 @@ mod tests {
     fn snapshot_survives_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let opts = Options {
-            sync_wal: false,
+            sync_wal: SyncMode::None,
             compaction_threshold: 3,
             ..Options::default()
         };

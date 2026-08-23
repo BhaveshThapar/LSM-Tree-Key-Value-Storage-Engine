@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use lsm_kv::{Db, Options, Snapshot};
+use lsm_kv::{Db, Options, Snapshot, SyncMode};
 use proptest::prelude::*;
 
 /// One operation in a generated sequence. The key space is deliberately tiny
@@ -31,7 +31,7 @@ fn run(ops: &[Op]) {
     let opts = Options {
         // A small threshold so flushes and compaction fire frequently.
         memtable_threshold: 256,
-        sync_wal: false,
+        sync_wal: SyncMode::None,
         compaction_threshold: 3,
         ..Options::default()
     };

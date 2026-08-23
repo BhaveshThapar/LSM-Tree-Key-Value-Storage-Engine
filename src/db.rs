@@ -28,6 +28,8 @@ use crate::sstable::{SsTableReader, SsTableWriter};
 use crate::wal::Wal;
 
 const WAL_FILENAME: &str = "wal.log";
+/// Scratch path for a WAL rewrite, published by rename.
+const WAL_TMP_FILENAME: &str = "wal.log.tmp";
 
 /// Tuning knobs for opening a database.
 #[derive(Debug, Clone)]
@@ -176,7 +178,7 @@ impl Db {
                 if !state.live_tables.contains(&id) {
                     fs::remove_file(dir.join(name.as_ref()))?;
                 }
-            } else if name.ends_with(".db.tmp") {
+            } else if name.ends_with(".db.tmp") || name == WAL_TMP_FILENAME {
                 fs::remove_file(dir.join(name.as_ref()))?;
             }
         }
@@ -496,13 +498,22 @@ impl DbInner {
         // Rewrite the WAL to back only the records written since the freeze.
         // Holding the WAL lock blocks appends — but they already serialize on
         // it — and `active` now holds exactly those post-freeze records.
+        //
+        // Built beside the live WAL and renamed over it. Truncating the live
+        // file in place would destroy the only durable copy of every write
+        // acknowledged since the freeze, for as long as it took to write them
+        // back — a window proportional to how much was written under load.
         {
             let mut wal = self.wal.lock();
             let active = self.active.read();
-            let mut fresh = Wal::create(self.dir.join(WAL_FILENAME), self.opts.sync_wal)?;
+            let tmp_path = self.dir.join(WAL_TMP_FILENAME);
+            let mut fresh = Wal::create(&tmp_path, self.opts.sync_wal)?;
             for record in active.iter() {
                 fresh.append(record)?;
             }
+            fresh.sync()?;
+            fresh.rename_to(self.dir.join(WAL_FILENAME))?;
+            fsutil::sync_dir(&self.dir)?;
             *wal = fresh;
         }
         *self.frozen.write() = None;
@@ -998,6 +1009,56 @@ mod tests {
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v3".to_vec()));
         assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    /// The fix is an ordering property, and this is the observable half of it:
+    /// if the live WAL were still being truncated in place, its inode would
+    /// survive the flush. A rename gives the name a different inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_publishes_a_new_wal_rather_than_truncating_the_live_one() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        db.put(b"a", b"1").unwrap();
+
+        let wal = dir.path().join(WAL_FILENAME);
+        let before = std::fs::metadata(&wal).unwrap().ino();
+
+        db.flush().unwrap();
+        db.put(b"b", b"2").unwrap();
+
+        let after = std::fs::metadata(&wal).unwrap().ino();
+        assert_ne!(
+            before, after,
+            "the live WAL was truncated in place, which loses every write \
+             acknowledged since the freeze if the process dies mid-rewrite"
+        );
+        assert!(
+            !dir.path().join(WAL_TMP_FILENAME).exists(),
+            "the scratch file should have been renamed away, not left behind"
+        );
+
+        drop(db);
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(db.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn a_stale_wal_scratch_file_is_reclaimed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+            db.put(b"k", b"v").unwrap();
+        }
+        // A crash between creating the scratch WAL and renaming it leaves this.
+        std::fs::write(dir.path().join(WAL_TMP_FILENAME), b"garbage").unwrap();
+
+        let db = Db::open_with(dir.path(), fast_opts()).unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert!(!dir.path().join(WAL_TMP_FILENAME).exists());
     }
 
     #[test]

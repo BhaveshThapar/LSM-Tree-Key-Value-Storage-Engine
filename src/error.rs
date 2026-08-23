@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,6 +12,9 @@ pub enum Error {
 
     #[error("unsupported sstable format: {0}")]
     BadFormat(String),
+
+    #[error("database directory is already open by another handle: {0}")]
+    Locked(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

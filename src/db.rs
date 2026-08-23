@@ -20,6 +20,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::compaction;
 use crate::compactor::{self, CompactMsg};
 use crate::error::Result;
+use crate::fsutil::{self, DirLock};
 use crate::manifest::{Manifest, ManifestState, VersionEdit};
 use crate::memtable::{MemTable, DEFAULT_THRESHOLD};
 use crate::record::Record;
@@ -92,6 +93,8 @@ impl Drop for Workers {
 pub(crate) struct DbInner {
     dir: PathBuf,
     opts: Options,
+    /// Held for the lifetime of the handle; released when it is dropped.
+    _lock: DirLock,
     /// Serializes WAL appends; also held across the matching MemTable insert
     /// so a record is never visible in one without the other.
     wal: Mutex<Wal>,
@@ -141,6 +144,14 @@ impl Db {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
+        // Before anything else. Everything below this line either mutates the
+        // directory or deletes from it — the manifest rolls its generation
+        // forward and unlinks the old one, and the reclamation loop removes
+        // every SSTable the manifest does not name. A second handle running the
+        // same sequence concurrently would delete this one's files, and this
+        // one would delete its files back.
+        let lock = DirLock::acquire(&dir)?;
+
         // The manifest is the authoritative record of the live SSTable set and
         // the global counters. If absent, migrate a Phase 2 directory by
         // scanning its `sst_*.db` files into a fresh manifest.
@@ -152,9 +163,13 @@ impl Db {
 
         // Reclaim orphan SSTables: any `sst_*.db` not named by the manifest is
         // a leftover from a crash before its `AddTable` edit was durable.
+        let lock_name = fsutil::lock_path(&dir);
         for entry in fs::read_dir(&dir)? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
+            if dir.join(name.as_ref()) == lock_name {
+                continue;
+            }
             if let Some(id) = parse_sst_id(&name) {
                 if !state.live_tables.contains(&id) {
                     fs::remove_file(dir.join(name.as_ref()))?;
@@ -194,6 +209,7 @@ impl Db {
         let inner = Arc::new(DbInner {
             dir,
             opts,
+            _lock: lock,
             wal: Mutex::new(wal),
             active: RwLock::new(memtable),
             frozen: RwLock::new(None),
@@ -731,7 +747,10 @@ mod tests {
                 );
             }
         }
-        // Survives reopen.
+        // Survives reopen. The first handle has to go first: shadowing the
+        // binding does not drop it, and two live handles on one directory
+        // reclaim each other's SSTables.
+        drop(db);
         let db = Db::open_with(dir.path(), fast_opts()).unwrap();
         assert_eq!(
             db.get(b"k2_0100").unwrap(),
@@ -917,6 +936,38 @@ mod tests {
 
         assert_eq!(db.get(b"k").unwrap(), Some(b"v3".to_vec()));
         assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn a_second_open_of_a_live_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        // Without this, the second open rolls the manifest forward, deletes the
+        // first handle's generation, and reclaims its SSTables as orphans.
+        match Db::open(dir.path()) {
+            Err(crate::error::Error::Locked(_)) => {}
+            other => panic!("expected Locked, got {:?}", other.map(|_| "Db")),
+        }
+
+        drop(db);
+        let reopened = Db::open(dir.path()).expect("the lock is released on drop");
+        assert_eq!(reopened.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn the_lock_file_is_not_reclaimed_as_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path()).unwrap();
+            db.put(b"k", b"v").unwrap();
+            db.flush().unwrap();
+        }
+        // Reopening runs the reclamation loop, which must leave LOCK alone.
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert!(crate::fsutil::lock_path(dir.path()).exists());
     }
 
     #[test]

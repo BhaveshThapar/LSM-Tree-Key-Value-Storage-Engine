@@ -19,6 +19,7 @@ mod compaction;
 mod compactor;
 mod db;
 mod error;
+mod fsutil;
 mod manifest;
 mod memtable;
 mod record;

@@ -3,8 +3,17 @@
 //!
 //! File layout: an eight-byte [header](crate::header), then frames.
 //!
-//! Frame layout: `[crc32:4][payload_len:4][payload]`, where `payload` is a
-//! [`Record`] encoding and the CRC is computed over `payload` only.
+//! Frame layout: `[crc32:4][payload_len:4][payload]`, where the CRC covers
+//! `payload` only.
+//!
+//! In version 2 the payload is `[count:u32]` followed by that many [`Record`]
+//! encodings. That is what makes a batch atomic: one frame, one CRC, so a crash
+//! that catches it mid-write leaves a frame that does not verify and replay
+//! discards *all* of it. A caller that needs two keys to become durable together
+//! — an index and the data it describes — gets that from the format rather than
+//! from luck.
+//!
+//! Version 1 held exactly one record per frame and is still read.
 //!
 //! A file written before the header existed is read without one; see
 //! [`crate::header`] for why that is accepted rather than refused.
@@ -12,8 +21,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::fs::{BufAppend, File, Fs, OpenMode};
-use crate::header::{self, Kind, WAL_MAGIC};
+use crate::fs::{BufAppend, File, Fs, OpenMode, SyncMode};
+use crate::header::{self, Kind, WAL_MAGIC, WAL_VERSION};
 use crate::record::Record;
 
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
@@ -22,7 +31,15 @@ const FRAME_HEADER: usize = 8; // crc32 + payload_len
 pub struct Wal<F: Fs> {
     file: BufAppend<F::File>,
     path: PathBuf,
-    sync: bool,
+    sync: SyncMode,
+    /// Whether frames appended to this file carry a batch count.
+    ///
+    /// Decided by what is already in the file, not by what this build prefers.
+    /// A version 1 file's frames hold exactly one record and no count, and
+    /// appending a counted frame to it would produce a file whose two halves
+    /// disagree about their own format — which is the failure the header exists
+    /// to prevent and would be an embarrassing way to cause.
+    counted: bool,
 }
 
 impl<F: Fs> Wal<F> {
@@ -32,15 +49,16 @@ impl<F: Fs> Wal<F> {
     /// would truncate a file that is still the only durable home of every write
     /// acknowledged since the last freeze; the flush path builds the
     /// replacement beside it and renames it into place instead.
-    pub fn create(fs: &F, path: impl Into<PathBuf>, sync: bool) -> Result<Wal<F>> {
+    pub fn create(fs: &F, path: impl Into<PathBuf>, sync: SyncMode) -> Result<Wal<F>> {
         let path = path.into();
         let file = fs.open(&path, OpenMode::Truncate)?;
         let mut wal = Wal {
             file: BufAppend::new(file),
             path,
             sync,
+            counted: true,
         };
-        wal.file.write(&header::encode(WAL_MAGIC))?;
+        wal.file.write(&header::encode(WAL_MAGIC, WAL_VERSION))?;
         // Out of the buffer immediately: a file that exists and holds nothing
         // is indistinguishable from one that was never written, and the flush
         // path renames this file into place over a live one.
@@ -52,14 +70,27 @@ impl<F: Fs> Wal<F> {
     ///
     /// This is the correct choice on database open: the file still backs the
     /// records just replayed into the MemTable until the next flush.
-    pub fn open_append(fs: &F, path: impl Into<PathBuf>, sync: bool) -> Result<Wal<F>> {
+    pub fn open_append(fs: &F, path: impl Into<PathBuf>, sync: SyncMode) -> Result<Wal<F>> {
         let path = path.into();
         let file = fs.open(&path, OpenMode::Append)?;
         let existing = file.size()?;
+
+        // What is already in the file decides what may be appended to it.
+        let mut front = [0u8; header::HEADER_LEN];
+        let front = if existing == 0 {
+            &front[..0]
+        } else {
+            let n = file.read_at(0, &mut front)?;
+            &front[..n]
+        };
+        let kind = header::classify(front, WAL_MAGIC, WAL_VERSION, "the write-ahead log")?;
+        let counted = matches!(kind, Kind::Empty) || kind == Kind::Versioned(WAL_VERSION);
+
         let mut wal = Wal {
             file: BufAppend::new(file),
             path,
             sync,
+            counted,
         };
         // A file that does not exist yet is created empty by `Append`, so it
         // needs the header this build writes. One that already has content —
@@ -67,7 +98,7 @@ impl<F: Fs> Wal<F> {
         // not something an append may do, and the flush that replaces this file
         // writes a fresh one with a header.
         if existing == 0 {
-            wal.file.write(&header::encode(WAL_MAGIC))?;
+            wal.file.write(&header::encode(WAL_MAGIC, WAL_VERSION))?;
             wal.file.flush()?;
         }
         Ok(wal)
@@ -80,19 +111,53 @@ impl<F: Fs> Wal<F> {
     }
 
     /// Append one record and flush it to the OS (and to disk if `sync`).
+    /// Append one record as a batch of one.
     pub fn append(&mut self, record: &Record) -> Result<()> {
-        let payload = record.encode();
+        self.append_batch(std::slice::from_ref(record))
+    }
+
+    /// Append `records` as a single frame, and sync once for all of them.
+    ///
+    /// The atomicity is the format's, not the filesystem's: the whole batch is
+    /// one length-prefixed payload under one CRC, so a crash mid-write leaves a
+    /// frame that does not verify and replay drops every record in it. There is
+    /// no interleaving in which half a batch survives.
+    ///
+    /// The single fsync is the other half. One `put` per fsync is the difference
+    /// between a usable write path and an unusable one, and a caller batching a
+    /// hundred keys should pay for one.
+    pub fn append_batch(&mut self, records: &[Record]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if !self.counted && records.len() > 1 {
+            // The alternative would be to write one frame per record and say
+            // nothing, which is a silent loss of the atomicity the caller asked
+            // for. A caller that needs a batch on a database opened before
+            // version 2 gets it after the next flush, which writes a fresh file.
+            return Err(Error::BadFormat(format!(
+                "{} is a version 1 write-ahead log and cannot hold a batch of {} records; \
+                 it is replaced by a version 2 file at the next flush",
+                self.path.display(),
+                records.len()
+            )));
+        }
+        let mut payload = Vec::new();
+        if self.counted {
+            payload.extend((records.len() as u32).to_le_bytes());
+        }
+        for record in records {
+            record.encode_into(&mut payload);
+        }
         let crc = crc32fast::hash(&payload);
         self.file.write(&crc.to_le_bytes())?;
         self.file.write(&(payload.len() as u32).to_le_bytes())?;
         self.file.write(&payload)?;
-        // A record that is still in this process's buffer is a record a crash
-        // loses without the file ever being short, so the buffer is emptied on
-        // every append whether or not the sync follows.
+        // A record still in this process's buffer is a record a crash loses
+        // without the file ever being short, so the buffer is emptied on every
+        // append whether or not a sync follows.
         self.file.flush()?;
-        if self.sync {
-            self.file.get_mut().sync()?;
-        }
+        self.file.get_mut().sync_as(self.sync)?;
         Ok(())
     }
 
@@ -102,7 +167,8 @@ impl<F: Fs> Wal<F> {
     /// about to publish this file by rename has to ask explicitly: the rename
     /// would otherwise make a file visible whose contents may not be on disk.
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync()?;
+        self.file.flush()?;
+        self.file.get_mut().sync_as(SyncMode::Durable)?;
         Ok(())
     }
 
@@ -128,10 +194,13 @@ impl<F: Fs> Wal<F> {
             Err(e) => return Err(e.into()),
         };
 
-        let kind = header::classify(&bytes, WAL_MAGIC, "the write-ahead log")?;
+        let kind = header::classify(&bytes, WAL_MAGIC, WAL_VERSION, "the write-ahead log")?;
         if kind == Kind::Empty {
             return Ok(Vec::new());
         }
+
+        // Version 1 wrote one record per frame with no count in front of it.
+        let counted = !matches!(kind, Kind::Legacy | Kind::Versioned(1));
 
         let mut records = Vec::new();
         let mut pos = header::frames_start(kind);
@@ -148,11 +217,29 @@ impl<F: Fs> Wal<F> {
                 break; // corrupt trailing frame
             }
             let mut rpos = 0;
-            let record = Record::decode_at(payload, &mut rpos)?;
+            let count = if counted {
+                if payload.len() < 4 {
+                    return Err(Error::Corrupt(
+                        "WAL frame too short for a batch count".into(),
+                    ));
+                }
+                rpos = 4;
+                u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4])) as usize
+            } else {
+                1
+            };
+            // Decode into a scratch vector and commit it only once the whole
+            // frame parses. A batch is atomic on the way in and must be atomic
+            // on the way out; pushing as we go would publish half of one if the
+            // second record were malformed.
+            let mut batch = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                batch.push(Record::decode_at(payload, &mut rpos)?);
+            }
             if rpos != payload.len() {
                 return Err(Error::Corrupt("trailing bytes in WAL frame".into()));
             }
-            records.push(record);
+            records.extend(batch);
             pos = end;
         }
         Ok(records)
@@ -174,7 +261,7 @@ mod tests {
     #[test]
     fn append_and_replay() {
         let (_d, path) = tmp();
-        let mut wal = Wal::create(&StdFs, &path, false).unwrap();
+        let mut wal = Wal::create(&StdFs, &path, SyncMode::None).unwrap();
         wal.append(&Record::put(b"a".to_vec(), b"1".to_vec(), 1))
             .unwrap();
         wal.append(&Record::tombstone(b"b".to_vec(), 2)).unwrap();
@@ -195,7 +282,7 @@ mod tests {
     #[test]
     fn torn_trailing_frame_is_ignored() {
         let (_d, path) = tmp();
-        let mut wal = Wal::create(&StdFs, &path, false).unwrap();
+        let mut wal = Wal::create(&StdFs, &path, SyncMode::None).unwrap();
         wal.append(&Record::put(b"good".to_vec(), b"v".to_vec(), 1))
             .unwrap();
         wal.append(&Record::put(b"torn".to_vec(), b"vvvv".to_vec(), 2))
@@ -216,7 +303,7 @@ mod tests {
     #[test]
     fn crc_mismatch_stops_replay() {
         let (_d, path) = tmp();
-        let mut wal = Wal::create(&StdFs, &path, false).unwrap();
+        let mut wal = Wal::create(&StdFs, &path, SyncMode::None).unwrap();
         wal.append(&Record::put(b"k".to_vec(), b"v".to_vec(), 1))
             .unwrap();
         drop(wal);
@@ -274,7 +361,7 @@ mod tests {
         bytes.extend(payload);
         std::fs::write(&path, &bytes).unwrap();
 
-        let mut wal = Wal::open_append(&StdFs, &path, false).unwrap();
+        let mut wal = Wal::open_append(&StdFs, &path, SyncMode::None).unwrap();
         wal.append(&Record::put(b"new".to_vec(), b"v".to_vec(), 2))
             .unwrap();
         wal.sync().unwrap();
@@ -291,7 +378,7 @@ mod tests {
     #[test]
     fn a_wal_whose_first_frame_is_torn_holds_no_records() {
         let (_d, path) = tmp();
-        let mut wal = Wal::create(&StdFs, &path, false).unwrap();
+        let mut wal = Wal::create(&StdFs, &path, SyncMode::None).unwrap();
         wal.append(&Record::put(b"k".to_vec(), b"v".to_vec(), 1))
             .unwrap();
         wal.sync().unwrap();
@@ -307,7 +394,7 @@ mod tests {
     #[test]
     fn a_fresh_wal_starts_with_a_header() {
         let (_d, path) = tmp();
-        drop(Wal::create(&StdFs, &path, false).unwrap());
+        drop(Wal::create(&StdFs, &path, SyncMode::None).unwrap());
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.len(), crate::header::HEADER_LEN);
         assert_eq!(&bytes[0..4], crate::header::WAL_MAGIC);

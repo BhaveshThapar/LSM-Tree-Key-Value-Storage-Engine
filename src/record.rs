@@ -51,6 +51,13 @@ impl Record {
         }
     }
 
+    /// The record's bytes on their own.
+    ///
+    /// `encode_into` is what the write paths use, because they are building a
+    /// frame that holds more than one record. This is for the places that want
+    /// exactly one — a test constructing a frame by hand, or a caller checking a
+    /// record's encoded form.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.encoded_len());
         self.encode_into(&mut buf);

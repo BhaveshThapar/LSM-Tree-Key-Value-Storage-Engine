@@ -28,8 +28,8 @@ mod record;
 mod sstable;
 mod wal;
 
-pub use db::{Db, Maintenance, Options, Snapshot};
-pub use fs::{BufAppend, File, Fs, OpenMode, StdFile, StdFs};
+pub use db::{Db, Maintenance, Options, Snapshot, WriteBatch};
+pub use fs::{BufAppend, File, Fs, OpenMode, StdFile, StdFs, SyncMode};
 
 /// Internal decoders exposed for fuzzing only (`--features fuzzing`).
 ///

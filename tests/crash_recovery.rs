@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use lsm_kv::{Db, Options};
+use lsm_kv::{Db, Options, SyncMode};
 
 const CHILD_ENV: &str = "LSM_CRASH_CHILD";
 const DIR_ENV: &str = "LSM_CRASH_DIR";
@@ -18,7 +18,7 @@ const DIR_ENV: &str = "LSM_CRASH_DIR";
 fn opts() -> Options {
     Options {
         memtable_threshold: 16 * 1024,
-        sync_wal: true,
+        sync_wal: SyncMode::Durable,
         ..Options::default()
     }
 }

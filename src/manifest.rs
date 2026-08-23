@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::fs::{BufAppend, File as _, Fs, OpenMode};
-use crate::header::{self, Kind, MANIFEST_MAGIC};
+use crate::header::{self, Kind, MANIFEST_MAGIC, MANIFEST_VERSION};
 
 const CURRENT_FILENAME: &str = "CURRENT";
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
@@ -140,7 +140,9 @@ impl<F: Fs> Manifest<F> {
             generation,
             file: BufAppend::new(file),
         };
-        manifest.file.write(&header::encode(MANIFEST_MAGIC))?;
+        manifest
+            .file
+            .write(&header::encode(MANIFEST_MAGIC, MANIFEST_VERSION))?;
         manifest.file.sync()?;
         write_current(fs, dir, generation)?;
         Ok(manifest)
@@ -171,7 +173,9 @@ impl<F: Fs> Manifest<F> {
             generation: new_gen,
             file: BufAppend::new(fs.open(&new_path, OpenMode::Truncate)?),
         };
-        writer.file.write(&header::encode(MANIFEST_MAGIC))?;
+        writer
+            .file
+            .write(&header::encode(MANIFEST_MAGIC, MANIFEST_VERSION))?;
         writer.append_batch(&state.snapshot_edits())?;
 
         // Atomic publish: CURRENT now names the new, durable generation.
@@ -222,7 +226,7 @@ fn replay<F: Fs>(fs: &F, path: &Path) -> Result<ManifestState> {
         Err(e) => return Err(e.into()),
     };
 
-    let kind = header::classify(&bytes, MANIFEST_MAGIC, "the manifest")?;
+    let kind = header::classify(&bytes, MANIFEST_MAGIC, MANIFEST_VERSION, "the manifest")?;
     if kind == Kind::Empty {
         return Ok(ManifestState::default());
     }

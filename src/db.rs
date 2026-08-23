@@ -473,7 +473,11 @@ impl DbInner {
         let records: Vec<Record> = frozen.iter().cloned().collect();
         SsTableWriter::write(&tmp_path, &records)?;
         // Atomic publish: a crash before the rename leaves only a stale .tmp.
+        // The writer already fsynced the file's contents; this makes its *name*
+        // durable, which is a separate thing and the one the manifest is about
+        // to depend on.
         fs::rename(&tmp_path, &final_path)?;
+        fsutil::sync_dir(&self.dir)?;
         let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
 
         // Record the new table in the manifest *before* truncating the WAL:
@@ -565,6 +569,9 @@ impl DbInner {
         {
             let _flush_guard = self.flush_lock.lock();
             fs::rename(&tmp_path, &final_path)?;
+            // Before the DeleteTable edits below: the merged output has to be
+            // durable at its name before the manifest says its inputs are gone.
+            fsutil::sync_dir(&self.dir)?;
             let reader = SsTableReader::open(&final_path, self.opts.bloom_enabled)?;
 
             let stale_ids: Vec<u64> = run[..run.len() - 1].iter().map(|t| t.id).collect();
@@ -593,6 +600,9 @@ impl DbInner {
             for id in &stale_ids {
                 fs::remove_file(sst_path(&self.dir, *id))?;
             }
+            // Hygiene only, and one fsync for the whole batch: a lost unlink is
+            // a space leak the next open reclaims, not a correctness problem.
+            fsutil::sync_dir(&self.dir)?;
         }
         Ok(true)
     }

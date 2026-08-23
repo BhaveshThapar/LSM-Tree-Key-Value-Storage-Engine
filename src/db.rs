@@ -532,7 +532,10 @@ impl DbInner {
         let run: Vec<Arc<SsTable>> = tables[start..end].to_vec();
         // The merged table reuses the run's highest id, keeping it in the same
         // position in the live set; the manifest makes the swap crash-safe.
-        let max_id = run.last().unwrap().id;
+        let Some(last) = run.last() else {
+            return Ok(false);
+        };
+        let max_id = last.id;
         let drop_tombstones = run[0].id == tables[0].id;
 
         // Read the snapshot horizon once: new snapshots only take a larger
@@ -564,10 +567,11 @@ impl DbInner {
             // A concurrent flush only appends, so the run is still a contiguous
             // block ending at `max_id`.
             let cur = self.sstables.read().clone();
-            let end_pos = cur
-                .iter()
-                .position(|t| t.id == max_id)
-                .expect("compacted run vanished from the live set");
+            let end_pos = cur.iter().position(|t| t.id == max_id).ok_or_else(|| {
+                crate::error::Error::Corrupt(format!(
+                    "compacted run vanished from the live set: sst {max_id}"
+                ))
+            })?;
             let start_pos = end_pos + 1 - run.len();
             let mut next = Vec::with_capacity(cur.len() - run.len() + 1);
             next.extend(cur[..start_pos].iter().cloned());

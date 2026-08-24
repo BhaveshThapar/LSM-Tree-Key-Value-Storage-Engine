@@ -565,6 +565,30 @@ impl<F: Fs> Db<F> {
         self.inner.sstables.read().len()
     }
 
+    /// Write a checkpoint of this database into `dir`.
+    ///
+    /// The SSTables are **hard-linked**, not copied, which is why a checkpoint
+    /// of a gigabyte costs milliseconds: the bytes are not moved, a second name
+    /// is added to them. It is also what makes the checkpoint independent — the
+    /// source may go on to compact and delete its own names, and a file's
+    /// contents outlive its last link rather than its first.
+    ///
+    /// The MemTable is flushed first, and only flushed: [`Db::flush`] would also
+    /// drain every pending compaction, which is a merge of unbounded size and
+    /// would make the stall a function of how many SSTables happen to have
+    /// accumulated rather than of how much is buffered.
+    ///
+    /// `dir` must be empty or absent. Writing a checkpoint over an existing one
+    /// would leave a directory describing two different states.
+    ///
+    /// What this does *not* do is write a write-ahead log into the checkpoint.
+    /// Everything buffered was flushed into an SSTable on the way in, so there
+    /// is nothing for one to hold; a checkpoint opens with an empty WAL and the
+    /// same contents.
+    pub fn checkpoint(&self, dir: impl AsRef<Path>) -> Result<()> {
+        self.inner.checkpoint(dir.as_ref())
+    }
+
     /// Take a point-in-time [`Snapshot`]: subsequent [`get_at`](Db::get_at)
     /// reads through it observe only writes made before this call.
     ///
@@ -784,6 +808,45 @@ impl<F: Fs> DbInner<F> {
             .next()
             .copied()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Flush, then hard-link the live SSTables into `dir` with a manifest.
+    fn checkpoint(&self, dir: &Path) -> Result<()> {
+        self.health()?;
+        self.flush_inner()?;
+
+        self.fs.create_dir_all(dir)?;
+        // A checkpoint over an existing one would describe two states. The
+        // manifest refuses that too, but failing before anything is linked
+        // leaves nothing to clean up.
+        if !self.fs.list(dir)?.is_empty() {
+            return Err(crate::error::Error::Corrupt(format!(
+                "{} is not empty; refusing to write a checkpoint over it",
+                dir.display()
+            )));
+        }
+
+        // Under the flush lock, so the set of live tables cannot change between
+        // reading it and linking it. A compaction that published mid-checkpoint
+        // would otherwise leave a manifest naming a table nobody linked.
+        let _flush_guard = self.flush_lock.lock();
+        let tables = self.sstables.read().clone();
+
+        for table in tables.iter() {
+            self.fs
+                .hard_link(&sst_path(&self.dir, table.id), &sst_path(dir, table.id))?;
+        }
+
+        let state = ManifestState {
+            live_tables: tables.iter().map(|t| t.id).collect(),
+            next_seq: self.next_seq.load(Ordering::SeqCst),
+            next_sst_id: self.next_sst_id.load(Ordering::SeqCst),
+        };
+        Manifest::write_fresh(&self.fs, dir, &state)?;
+        // The links and the manifest are both named in this directory, and a
+        // lost name is a checkpoint that will not open.
+        self.fs.sync_dir(dir)?;
+        Ok(())
     }
 
     /// Whether there is anything for a flush to do.

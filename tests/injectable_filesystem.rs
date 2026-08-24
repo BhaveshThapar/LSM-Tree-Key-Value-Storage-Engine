@@ -65,6 +65,9 @@ impl Fs for CountingFs {
         self.counts.renames.fetch_add(1, Ordering::SeqCst);
         StdFs.rename(from, to)
     }
+    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
+        StdFs.hard_link(original, link)
+    }
     fn remove(&self, path: &Path) -> io::Result<()> {
         self.counts.removes.fetch_add(1, Ordering::SeqCst);
         StdFs.remove(path)
@@ -236,6 +239,21 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    /// Two names for one `Blob`, which is what a hard link is: removing either
+    /// name leaves the other reading the same bytes.
+    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
+        let mut files = self.files.borrow_mut();
+        if files.contains_key(link) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "link exists"));
+        }
+        let blob = files
+            .get(original)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))?;
+        files.insert(link.to_path_buf(), blob);
+        Ok(())
+    }
+
     fn remove(&self, path: &Path) -> io::Result<()> {
         self.files
             .borrow_mut()
@@ -359,6 +377,9 @@ impl Fs for RefusingFs {
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         StdFs.rename(from, to)
+    }
+    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
+        StdFs.hard_link(original, link)
     }
     fn remove(&self, path: &Path) -> io::Result<()> {
         StdFs.remove(path)

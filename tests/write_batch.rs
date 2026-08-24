@@ -76,6 +76,9 @@ impl Fs for CountingFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         StdFs.rename(from, to)
     }
+    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
+        StdFs.hard_link(original, link)
+    }
     fn remove(&self, path: &Path) -> io::Result<()> {
         StdFs.remove(path)
     }

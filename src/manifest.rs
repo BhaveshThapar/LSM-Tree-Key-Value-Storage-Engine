@@ -118,6 +118,26 @@ impl<F: Fs> Manifest<F> {
         fs.exists(&dir.join(CURRENT_FILENAME))
     }
 
+    /// Write `state` as a complete manifest in a directory that has none.
+    ///
+    /// For building a checkpoint: generation zero, every live table named, and
+    /// `CURRENT` pointing at it. Refuses a directory that already has a
+    /// manifest, because writing over one would leave a checkpoint describing
+    /// two different states.
+    pub fn write_fresh(fs: &F, dir: &Path, state: &ManifestState) -> Result<()> {
+        if Self::exists(fs, dir) {
+            return Err(Error::Corrupt(format!(
+                "{} already holds a manifest; refusing to write a second one over it",
+                dir.display()
+            )));
+        }
+        let mut manifest = Self::create(fs, dir)?;
+        manifest.append_batch(&state.snapshot_edits())?;
+        manifest.file.sync()?;
+        fs.sync_dir(dir)?;
+        Ok(())
+    }
+
     /// Open the existing manifest at `dir`, replay it, and roll it over into a
     /// fresh compacted generation. Returns the writer and the replayed state.
     pub fn open(fs: &F, dir: &Path) -> Result<(Manifest<F>, ManifestState)> {

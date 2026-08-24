@@ -78,6 +78,18 @@ pub trait Fs: 'static {
     fn list(&self, dir: &Path) -> io::Result<Vec<PathBuf>>;
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Self::File>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// Make `link` another name for the file at `original`.
+    ///
+    /// A hard link rather than a copy, and that is the whole reason a checkpoint
+    /// of a gigabyte costs milliseconds: the bytes are not moved, a second name
+    /// is added to them. It also means the source may go on to delete its own
+    /// name — a compaction does exactly that — and the checkpoint's name keeps
+    /// the data alive, because a file's contents outlive its last link and not
+    /// its first.
+    ///
+    /// Fails if `link` exists. A checkpoint that silently replaced a file it did
+    /// not expect to be there would be a checkpoint of two different states.
+    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()>;
     fn remove(&self, path: &Path) -> io::Result<()>;
     fn size(&self, path: &Path) -> io::Result<u64>;
     /// fsync a directory, so a create or a rename within it is durable.
@@ -283,6 +295,10 @@ impl Fs for StdFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    fn hard_link(&self, original: &Path, link: &Path) -> io::Result<()> {
+        std::fs::hard_link(original, link)
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
@@ -510,6 +526,42 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    /// The property a checkpoint is built on: a second name keeps the bytes
+    /// alive after the first one is removed.
+    #[test]
+    fn a_hard_link_outlives_the_name_it_was_made_from() {
+        let d = dir();
+        let fs = StdFs;
+        let (original, link) = (d.path().join("original"), d.path().join("link"));
+        fs.open(&original, OpenMode::Truncate)
+            .unwrap()
+            .append(b"the bytes")
+            .unwrap();
+
+        fs.hard_link(&original, &link).unwrap();
+        fs.remove(&original).unwrap();
+
+        assert!(!fs.exists(&original));
+        assert_eq!(
+            fs.open(&link, OpenMode::Read).unwrap().read_all().unwrap(),
+            b"the bytes",
+            "removing the original took the data with it"
+        );
+    }
+
+    #[test]
+    fn a_hard_link_onto_an_existing_name_is_refused() {
+        let d = dir();
+        let fs = StdFs;
+        let (a, b) = (d.path().join("a"), d.path().join("b"));
+        fs.open(&a, OpenMode::Truncate).unwrap();
+        fs.open(&b, OpenMode::Truncate).unwrap();
+        assert!(
+            fs.hard_link(&a, &b).is_err(),
+            "linking onto an existing name would make a checkpoint of two states"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::fs::{BufAppend, File, Fs, OpenMode, SyncMode};
-use crate::header::{self, Kind, WAL_MAGIC, WAL_VERSION};
+use crate::header::{self, Checksum, Kind, WAL_MAGIC, WAL_VERSION};
 use crate::record::Record;
 
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
@@ -32,6 +32,9 @@ pub struct Wal<F: Fs> {
     file: BufAppend<F::File>,
     path: PathBuf,
     sync: SyncMode,
+    /// Which checksum this file's frames are protected by. Decided by the
+    /// file, like `counted` and for the same reason.
+    checksum: Checksum,
     /// Whether frames appended to this file carry a batch count.
     ///
     /// Decided by what is already in the file, not by what this build prefers.
@@ -56,6 +59,7 @@ impl<F: Fs> Wal<F> {
             file: BufAppend::new(file),
             path,
             sync,
+            checksum: header::wal_checksum(Kind::Versioned(WAL_VERSION)),
             counted: true,
         };
         wal.file.write(&header::encode(WAL_MAGIC, WAL_VERSION))?;
@@ -84,12 +88,17 @@ impl<F: Fs> Wal<F> {
             &front[..n]
         };
         let kind = header::classify(front, WAL_MAGIC, WAL_VERSION, "the write-ahead log")?;
-        let counted = matches!(kind, Kind::Empty) || kind == Kind::Versioned(WAL_VERSION);
+        let effective = match kind {
+            Kind::Empty => Kind::Versioned(WAL_VERSION),
+            other => other,
+        };
+        let counted = !matches!(effective, Kind::Legacy | Kind::Versioned(1));
 
         let mut wal = Wal {
             file: BufAppend::new(file),
             path,
             sync,
+            checksum: header::wal_checksum(effective),
             counted,
         };
         // A file that does not exist yet is created empty by `Append`, so it
@@ -149,7 +158,7 @@ impl<F: Fs> Wal<F> {
         for record in records {
             record.encode_into(&mut payload);
         }
-        let crc = crc32fast::hash(&payload);
+        let crc = self.checksum.hash(&payload);
         self.file.write(&crc.to_le_bytes())?;
         self.file.write(&(payload.len() as u32).to_le_bytes())?;
         self.file.write(&payload)?;
@@ -201,6 +210,7 @@ impl<F: Fs> Wal<F> {
 
         // Version 1 wrote one record per frame with no count in front of it.
         let counted = !matches!(kind, Kind::Legacy | Kind::Versioned(1));
+        let checksum = header::wal_checksum(kind);
 
         let mut records = Vec::new();
         let mut pos = header::frames_start(kind);
@@ -213,7 +223,7 @@ impl<F: Fs> Wal<F> {
                 _ => break, // torn trailing frame
             };
             let payload = &bytes[start..end];
-            if crc32fast::hash(payload) != crc {
+            if checksum.hash(payload) != crc {
                 break; // corrupt trailing frame
             }
             let mut rpos = 0;

@@ -26,13 +26,58 @@ pub(crate) const HEADER_LEN: usize = 8;
 
 /// Format version of the write-ahead log written by this build.
 ///
-/// Version 1 held one record per frame. Version 2 holds a count and then that
-/// many records, so a batch is one frame under one CRC and a crash either takes
-/// all of it or none of it.
-pub(crate) const WAL_VERSION: u16 = 2;
+/// * 1 — one record per frame, CRC-32/ISO-HDLC.
+/// * 2 — a count and then that many records, so a batch is one frame under one
+///   CRC and a crash either takes all of it or none of it. Same checksum.
+/// * 3 — the same frames under CRC32C.
+pub(crate) const WAL_VERSION: u16 = 3;
 
 /// Format version of the manifest written by this build.
-pub(crate) const MANIFEST_VERSION: u16 = 1;
+///
+/// * 1 — CRC-32/ISO-HDLC.
+/// * 2 — CRC32C.
+pub(crate) const MANIFEST_VERSION: u16 = 2;
+
+/// Which checksum a file's frames are protected by.
+///
+/// Two of them exist here only because one of them replaced the other, and a
+/// file written by an older build has to keep verifying. Changing the checksum
+/// without version-gating it would make every existing frame fail its CRC —
+/// which for the manifest is not a failed open but a successful one that
+/// reclaims every SSTable in the directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Checksum {
+    /// CRC-32/ISO-HDLC, the `crc32fast` default. What the engine started with.
+    IsoHdlc,
+    /// CRC32C (Castagnoli). Hardware-accelerated on every CPU this runs on, and
+    /// the polynomial every other storage format in this project uses.
+    Castagnoli,
+}
+
+impl Checksum {
+    pub(crate) fn hash(self, bytes: &[u8]) -> u32 {
+        match self {
+            Checksum::IsoHdlc => crc32fast::hash(bytes),
+            Checksum::Castagnoli => crc32c::crc32c(bytes),
+        }
+    }
+}
+
+/// The checksum a write-ahead log of this version uses.
+pub(crate) fn wal_checksum(kind: Kind) -> Checksum {
+    match kind {
+        Kind::Versioned(v) if v >= 3 => Checksum::Castagnoli,
+        _ => Checksum::IsoHdlc,
+    }
+}
+
+/// The checksum a manifest of this version uses.
+pub(crate) fn manifest_checksum(kind: Kind) -> Checksum {
+    match kind {
+        Kind::Versioned(v) if v >= 2 => Checksum::Castagnoli,
+        _ => Checksum::IsoHdlc,
+    }
+}
 
 /// Marks the front of a write-ahead log.
 pub(crate) const WAL_MAGIC: &[u8; 4] = b"LSMW";
@@ -156,6 +201,29 @@ mod tests {
         assert!(
             matches!(err, Error::BadFormat(_)),
             "a future version gave {err:?} rather than BadFormat"
+        );
+    }
+
+    #[test]
+    fn the_checksum_is_decided_by_the_version_not_by_this_build() {
+        assert_eq!(wal_checksum(Kind::Legacy), Checksum::IsoHdlc);
+        assert_eq!(wal_checksum(Kind::Versioned(1)), Checksum::IsoHdlc);
+        assert_eq!(wal_checksum(Kind::Versioned(2)), Checksum::IsoHdlc);
+        assert_eq!(wal_checksum(Kind::Versioned(3)), Checksum::Castagnoli);
+
+        assert_eq!(manifest_checksum(Kind::Legacy), Checksum::IsoHdlc);
+        assert_eq!(manifest_checksum(Kind::Versioned(1)), Checksum::IsoHdlc);
+        assert_eq!(manifest_checksum(Kind::Versioned(2)), Checksum::Castagnoli);
+    }
+
+    /// The two disagree on real input, or version-gating them would be
+    /// pointless and every test here would pass for the wrong reason.
+    #[test]
+    fn the_two_checksums_are_actually_different() {
+        let payload = b"a frame's worth of bytes, more or less";
+        assert_ne!(
+            Checksum::IsoHdlc.hash(payload),
+            Checksum::Castagnoli.hash(payload)
         );
     }
 

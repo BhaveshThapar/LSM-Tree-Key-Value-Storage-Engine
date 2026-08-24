@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::fs::{BufAppend, File as _, Fs, OpenMode};
-use crate::header::{self, Kind, MANIFEST_MAGIC, MANIFEST_VERSION};
+use crate::header::{self, Checksum, Kind, MANIFEST_MAGIC, MANIFEST_VERSION};
 
 const CURRENT_FILENAME: &str = "CURRENT";
 const FRAME_HEADER: usize = 8; // crc32 + payload_len
@@ -106,6 +106,10 @@ pub struct Manifest<F: Fs> {
     dir: PathBuf,
     generation: u64,
     file: BufAppend<F::File>,
+    /// Which checksum this generation's frames use. Every generation this build
+    /// writes is the current one; the field exists because `open` appends to a
+    /// generation it did not write before rolling it over.
+    checksum: Checksum,
 }
 
 impl<F: Fs> Manifest<F> {
@@ -123,6 +127,7 @@ impl<F: Fs> Manifest<F> {
             dir: dir.to_path_buf(),
             generation,
             file: BufAppend::new(fs.open(&manifest_path(dir, generation), OpenMode::Append)?),
+            checksum: header::manifest_checksum(classify_manifest(fs, dir, generation)?),
         };
         // Compact the log so it never grows across the lifetime of the dir.
         manifest.rollover(fs, &state)?;
@@ -139,6 +144,7 @@ impl<F: Fs> Manifest<F> {
             dir: dir.to_path_buf(),
             generation,
             file: BufAppend::new(file),
+            checksum: header::manifest_checksum(Kind::Versioned(MANIFEST_VERSION)),
         };
         manifest
             .file
@@ -152,7 +158,7 @@ impl<F: Fs> Manifest<F> {
     pub fn append_batch(&mut self, edits: &[VersionEdit]) -> Result<()> {
         for edit in edits {
             let payload = edit.encode();
-            let crc = crc32fast::hash(&payload);
+            let crc = self.checksum.hash(&payload);
             self.file.write(&crc.to_le_bytes())?;
             self.file.write(&(payload.len() as u32).to_le_bytes())?;
             self.file.write(&payload)?;
@@ -172,6 +178,7 @@ impl<F: Fs> Manifest<F> {
             dir: self.dir.clone(),
             generation: new_gen,
             file: BufAppend::new(fs.open(&new_path, OpenMode::Truncate)?),
+            checksum: header::manifest_checksum(Kind::Versioned(MANIFEST_VERSION)),
         };
         writer
             .file
@@ -183,6 +190,7 @@ impl<F: Fs> Manifest<F> {
 
         self.generation = new_gen;
         self.file = writer.file;
+        self.checksum = writer.checksum;
         let _ = fs.remove(&manifest_path(&self.dir, old_gen));
         Ok(())
     }
@@ -217,6 +225,22 @@ fn write_current<F: Fs>(fs: &F, dir: &Path, generation: u64) -> Result<()> {
     Ok(())
 }
 
+/// What version a manifest generation on disk is, so an append to it uses that
+/// generation's checksum rather than this build's.
+fn classify_manifest<F: Fs>(fs: &F, dir: &Path, generation: u64) -> Result<Kind> {
+    let path = manifest_path(dir, generation);
+    let mut front = [0u8; header::HEADER_LEN];
+    let front = match fs.open(&path, OpenMode::Read) {
+        Ok(f) => {
+            let n = f.read_at(0, &mut front)?;
+            &front[..n]
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => &front[..0],
+        Err(e) => return Err(e.into()),
+    };
+    header::classify(front, MANIFEST_MAGIC, MANIFEST_VERSION, "the manifest")
+}
+
 /// Replay a manifest file into a [`ManifestState`], tolerating a torn trailing
 /// frame from a crash mid-append.
 fn replay<F: Fs>(fs: &F, path: &Path) -> Result<ManifestState> {
@@ -230,6 +254,7 @@ fn replay<F: Fs>(fs: &F, path: &Path) -> Result<ManifestState> {
     if kind == Kind::Empty {
         return Ok(ManifestState::default());
     }
+    let checksum = header::manifest_checksum(kind);
 
     let mut state = ManifestState::default();
     let first_frame = header::frames_start(kind);
@@ -244,7 +269,7 @@ fn replay<F: Fs>(fs: &F, path: &Path) -> Result<ManifestState> {
             _ => break, // torn trailing frame
         };
         let payload = &bytes[start..end];
-        if crc32fast::hash(payload) != crc {
+        if checksum.hash(payload) != crc {
             break; // corrupt trailing frame
         }
         state.apply(VersionEdit::decode(payload)?);

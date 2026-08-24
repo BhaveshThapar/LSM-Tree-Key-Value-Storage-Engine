@@ -11,6 +11,7 @@ path = "src/bin/lsm.rs"
 [dependencies]
 thiserror = "2"
 crc32fast = "1"
+crc32c = "0.6"
 lz4_flex = "0.11"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 parking_lot = "0.12"
@@ -19,6 +20,8 @@ parking_lot = "0.12"
 libc = "0.2"
 
 [dev-dependencies]
+# The format-version test rewrites frames the way an older build would.
+crc32fast = "1"
 tempfile = "3"
 criterion = "0.5"
 rocksdb = "0.22"

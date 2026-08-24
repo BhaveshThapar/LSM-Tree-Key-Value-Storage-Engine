@@ -39,6 +39,7 @@ pub use fs::{BufAppend, File, Fs, OpenMode, StdFile, StdFs, SyncMode};
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {
     use crate::Result;
+    use crate::fs::StdFs;
     use std::path::Path;
 
     /// Decode a single [`Record`](crate::record::Record) from raw bytes.
@@ -49,12 +50,12 @@ pub mod fuzzing {
 
     /// Replay a WAL file holding arbitrary bytes.
     pub fn replay_wal(path: &Path) -> Result<()> {
-        crate::wal::Wal::replay(path).map(|_| ())
+        crate::wal::Wal::<StdFs>::replay(&StdFs, path).map(|_| ())
     }
 
     /// Open an SSTable file holding arbitrary bytes.
     pub fn open_sstable(path: &Path) -> Result<()> {
-        crate::sstable::SsTableReader::open(path, true).map(|_| ())
+        crate::sstable::SsTableReader::open(&StdFs, path, true).map(|_| ())
     }
 }
 pub use error::{Error, Result};

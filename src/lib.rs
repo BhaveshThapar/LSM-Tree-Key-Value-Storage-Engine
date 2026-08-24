@@ -25,6 +25,7 @@ mod header;
 mod manifest;
 mod memtable;
 mod record;
+mod scan;
 mod sstable;
 mod wal;
 
